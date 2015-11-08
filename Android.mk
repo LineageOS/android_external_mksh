@@ -16,13 +16,6 @@ LOCAL_SRC_FILES := $(LOCAL_MODULE)
 include $(BUILD_PREBUILT)
 
 
-# /system/bin/sh
-
-include $(CLEAR_VARS)
-
-LOCAL_MODULE := sh
-LOCAL_ADDITIONAL_DEPENDENCIES += $(LOCAL_PATH)/Android.mk
-
 # mksh source files
 MKSH_SRC_FILES := \
     src/lalloc.c src/edit.c src/eval.c src/exec.c \
@@ -75,6 +68,23 @@ MKSH_CFLAGS += \
     -DHAVE_SYS_ERRLIST_DECL=0 -DHAVE_SYS_SIGLIST_DECL=1 \
     -DHAVE_PERSISTENT_HISTORY=0 -DMKSH_BUILD_R=551
 
+
+include $(CLEAR_VARS)
+LOCAL_MODULE := libmksh
+LOCAL_ADDITIONAL_DEPENDENCIES += $(LOCAL_PATH)/Android.mk
+LOCAL_SRC_FILES := $(MKSH_SRC_FILES)
+LOCAL_C_INCLUDES := $(MKSH_INCLUDES)
+LOCAL_CFLAGS := $(MKSH_CFLAGS)
+include $(BUILD_STATIC_LIBRARY)
+
+
+# /system/bin/sh
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE := sh
+LOCAL_ADDITIONAL_DEPENDENCIES += $(LOCAL_PATH)/Android.mk
+
 LOCAL_SRC_FILES := $(MKSH_SRC_FILES)
 
 LOCAL_SYSTEM_SHARED_LIBRARIES := libc
@@ -91,6 +101,22 @@ LOCAL_CFLAGS += \
 LOCAL_CFLAGS += $(MKSH_CFLAGS)
 
 include $(BUILD_EXECUTABLE)
+
+# recovery shell: /sbin/sh
+# this is built into a single-call binary
+include $(CLEAR_VARS)
+LOCAL_MODULE := libmksh_driver
+LOCAL_MODULE_TAGS := optional
+LOCAL_SRC_FILES := src/main.c
+LOCAL_WHOLE_STATIC_LIBRARIES := libmksh
+LOCAL_CFLAGS += \
+    -DMKSH_DEFAULT_PROFILEDIR=\"/etc\" \
+    -DMKSHRC_PATH=\"/etc/mkshrc\" \
+    -DMKSH_DEFAULT_EXECSHELL=\"/sbin/sh\" \
+    -DMKSH_DEFAULT_TMPDIR=\"/tmp\"
+LOCAL_CFLAGS += -Dmain=mksh_main
+LOCAL_CFLAGS += $(MKSH_CFLAGS)
+include $(BUILD_STATIC_LIBRARY)
 
 # /vendor/etc/mkshrc
 include $(CLEAR_VARS)
