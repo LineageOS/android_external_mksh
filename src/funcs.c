@@ -122,9 +122,7 @@ const struct builtin mkshbuiltins[] = {
 	{"kill", c_kill},
 	{"let", c_let},
 	{"let]", c_let},
-#if !defined(__ANDROID__)
 	{"print", c_print},
-#endif
 	{"pwd", c_pwd},
 	{Tread, c_read},
 	{Tsgreadonly, c_typeset},
