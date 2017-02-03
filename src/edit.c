@@ -1,10 +1,11 @@
-/*	$OpenBSD: edit.c,v 1.34 2010/05/20 01:13:07 fgsch Exp $	*/
+/*	$OpenBSD: edit.c,v 1.40 2015/03/12 10:20:30 sthen Exp $	*/
 /*	$OpenBSD: edit.h,v 1.9 2011/05/30 17:14:35 martynas Exp $	*/
-/*	$OpenBSD: emacs.c,v 1.44 2011/09/05 04:50:33 marco Exp $	*/
-/*	$OpenBSD: vi.c,v 1.26 2009/06/29 22:50:19 martynas Exp $	*/
+/*	$OpenBSD: emacs.c,v 1.50 2015/03/25 12:10:52 jca Exp $	*/
+/*	$OpenBSD: vi.c,v 1.28 2013/12/18 16:45:46 deraadt Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+ *		 2011, 2012, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -25,7 +26,9 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/edit.c,v 1.222 2011/10/07 19:45:08 tg Exp $");
+#ifndef MKSH_NO_CMDLINE_EDITING
+
+__RCSID("$MirOS: src/bin/mksh/edit.c,v 1.276.2.5 2015/04/12 22:32:22 tg Exp $");
 
 /*
  * in later versions we might use libtermcap for this, but since external
@@ -58,42 +61,43 @@ static X_chars edchars;
 #define XCF_FULLPATH	BIT(2)	/* command completion: store full path */
 #define XCF_COMMAND_FILE (XCF_COMMAND | XCF_FILE)
 #define XCF_IS_COMMAND	BIT(3)	/* return flag: is command */
-#define XCF_IS_SUBGLOB	BIT(4)	/* return flag: is $FOO or ~foo substitution */
-#define XCF_IS_EXTGLOB	BIT(5)	/* return flag: is foo* expansion */
+#define XCF_IS_NOSPACE	BIT(4)	/* return flag: do not append a space */
 
 static char editmode;
 static int xx_cols;			/* for Emacs mode */
 static int modified;			/* buffer has been "modified" */
-static char holdbuf[LINE];		/* place to hold last edit buffer */
+static char *holdbufp;			/* place to hold last edit buffer */
 
 static int x_getc(void);
 static void x_putcf(int);
+static void x_modified(void);
 static void x_mode(bool);
 static int x_do_comment(char *, ssize_t, ssize_t *);
-static void x_print_expansions(int, char *const *, bool);
+static void x_print_expansions(int, char * const *, bool);
 static int x_cf_glob(int *, const char *, int, int, int *, int *, char ***);
-static size_t x_longest_prefix(int, char *const *);
+static size_t x_longest_prefix(int, char * const *);
+static void x_glob_hlp_add_qchar(char *);
+static char *x_glob_hlp_tilde_and_rem_qchar(char *, bool);
 static int x_basename(const char *, const char *);
 static void x_free_words(int, char **);
 static int x_escape(const char *, size_t, int (*)(const char *, size_t));
-static int x_emacs(char *, size_t);
-static void x_init_emacs(void);
-static void x_init_prompt(void);
+static int x_emacs(char *);
+static void x_init_prompt(bool);
 #if !MKSH_S_NOVI
-static int x_vi(char *, size_t);
+static int x_vi(char *);
 #endif
 
 #define x_flush()	shf_flush(shl_out)
-#ifdef MKSH_SMALL
+#if defined(MKSH_SMALL) && !defined(MKSH_SMALL_BUT_FAST)
 #define x_putc(c)	x_putcf(c)
 #else
 #define x_putc(c)	shf_putc((c), shl_out)
 #endif
 
-static int path_order_cmp(const void *aa, const void *bb);
+static int path_order_cmp(const void *, const void *);
 static void glob_table(const char *, XPtrV *, struct table *);
-static void glob_path(int flags, const char *, XPtrV *, const char *);
-static int x_file_glob(int, char *, char ***);
+static void glob_path(int, const char *, XPtrV *, const char *);
+static int x_file_glob(int *, char *, char ***);
 static int x_command_glob(int, char *, char ***);
 static int x_locate_word(const char *, int, int, int *, bool *);
 
@@ -102,36 +106,21 @@ static int x_e_rebuildline(const char *);
 
 /* +++ generic editing functions +++ */
 
-/* Called from main */
-void
-x_init(void)
-{
-	/*
-	 * Set edchars to -2 to force initial binding, except
-	 * we need default values for some deficient systems…
-	 */
-	edchars.erase = edchars.kill = edchars.intr = edchars.quit =
-	    edchars.eof = -2;
-	/* ^W */
-	edchars.werase = 027;
-	x_init_emacs();
-}
-
 /*
  * read an edited command line
  */
 int
-x_read(char *buf, size_t len)
+x_read(char *buf)
 {
 	int i;
 
 	x_mode(true);
 	modified = 1;
 	if (Flag(FEMACS) || Flag(FGMACS))
-		i = x_emacs(buf, len);
+		i = x_emacs(buf);
 #if !MKSH_S_NOVI
 	else if (Flag(FVI))
-		i = x_vi(buf, len);
+		i = x_vi(buf);
 #endif
 	else
 		/* internal error */
@@ -159,6 +148,7 @@ x_getc(void)
 				if (x_cols != xx_cols && editmode == 1) {
 					/* redraw line in Emacs mode */
 					xx_cols = x_cols;
+					x_init_prompt(false);
 					x_e_rebuildline(MKSH_CLRTOEOL_STRING);
 				}
 			}
@@ -237,7 +227,7 @@ x_print_expansions(int nwords, char * const *words, bool is_command)
 {
 	bool use_copy = false;
 	int prefix_len;
-	XPtrV l = { NULL, NULL, NULL };
+	XPtrV l = { NULL, 0, 0 };
 
 	/*
 	 * Check if all matches are in the same directory (in this
@@ -278,40 +268,109 @@ x_print_expansions(int nwords, char * const *words, bool is_command)
 		XPfree(l);
 }
 
+/*
+ * Convert backslash-escaped string to QCHAR-escaped
+ * string useful for globbing; loses QCHAR unless it
+ * can squeeze in, eg. by previous loss of backslash
+ */
+static void
+x_glob_hlp_add_qchar(char *cp)
+{
+	char ch, *dp = cp;
+	bool escaping = false;
+
+	while ((ch = *cp++)) {
+		if (ch == '\\' && !escaping) {
+			escaping = true;
+			continue;
+		}
+		if (escaping || (ch == QCHAR && (cp - dp) > 1)) {
+			/*
+			 * empirically made list of chars to escape
+			 * for globbing as well as QCHAR itself
+			 */
+			switch (ch) {
+			case QCHAR:
+			case '$':
+			case '*':
+			case '?':
+			case '[':
+			case '\\':
+			case '`':
+				*dp++ = QCHAR;
+				break;
+			}
+			escaping = false;
+		}
+		*dp++ = ch;
+	}
+	*dp = '\0';
+}
+
+/*
+ * Run tilde expansion on argument string, return the result
+ * after unescaping; if the flag is set, the original string
+ * is freed if changed and assumed backslash-escaped, if not
+ * it is assumed QCHAR-escaped
+ */
+static char *
+x_glob_hlp_tilde_and_rem_qchar(char *s, bool magic_flag)
+{
+	char ch, *cp, *dp;
+
+	/*
+	 * On the string, check whether we have a tilde expansion,
+	 * and if so, discern "~foo/bar" and "~/baz" from "~blah";
+	 * if we have a directory part (the former), try to expand
+	 */
+	if (*s == '~' && (cp = strchr(s, '/')) != NULL) {
+		/* ok, so split into "~foo"/"bar" or "~"/"baz" */
+		*cp++ = 0;
+		/* try to expand the tilde */
+		if (!(dp = do_tilde(s + 1))) {
+			/* nope, revert damage */
+			*--cp = '/';
+		} else {
+			/* ok, expand and replace */
+			cp = shf_smprintf("%s/%s", dp, cp);
+			if (magic_flag)
+				afree(s, ATEMP);
+			s = cp;
+		}
+	}
+
+	/* ... convert it from backslash-escaped via QCHAR-escaped... */
+	if (magic_flag)
+		x_glob_hlp_add_qchar(s);
+	/* ... to unescaped, for comparison with the matches */
+	cp = dp = s;
+
+	while ((ch = *cp++)) {
+		if (ch == QCHAR && !(ch = *cp++))
+			break;
+		*dp++ = ch;
+	}
+	*dp = '\0';
+
+	return (s);
+}
+
 /**
  * Do file globbing:
- *	- appends * to (copy of) str if no globbing chars found
  *	- does expansion, checks for no match, etc.
  *	- sets *wordsp to array of matching strings
  *	- returns number of matching strings
  */
 static int
-x_file_glob(int flags MKSH_A_UNUSED, char *toglob, char ***wordsp)
+x_file_glob(int *flagsp, char *toglob, char ***wordsp)
 {
-	char **words;
-	int nwords, i, idx;
-	bool escaping;
+	char **words, *cp;
+	int nwords;
 	XPtrV w;
 	struct source *s, *sold;
 
 	/* remove all escaping backward slashes */
-	escaping = false;
-	for (i = 0, idx = 0; toglob[i]; i++) {
-		if (toglob[i] == '\\' && !escaping) {
-			escaping = true;
-			continue;
-		}
-		/* specially escape escaped [ or $ or ` for globbing */
-		if (escaping && (toglob[i] == '[' ||
-		    toglob[i] == '$' || toglob[i] == '`'))
-			toglob[idx++] = QCHAR;
-
-		toglob[idx] = toglob[i];
-		idx++;
-		if (escaping)
-			escaping = false;
-	}
-	toglob[idx] = '\0';
+	x_glob_hlp_add_qchar(toglob);
 
 	/*
 	 * Convert "foo*" (toglob) to an array of strings (words)
@@ -326,8 +385,19 @@ x_file_glob(int flags MKSH_A_UNUSED, char *toglob, char ***wordsp)
 		return (0);
 	}
 	source = sold;
+	afree(s, ATEMP);
 	XPinit(w, 32);
-	expand(yylval.cp, &w, DOGLOB | DOTILDE | DOMARKDIRS);
+	cp = yylval.cp;
+	while (*cp == CHAR || *cp == QCHAR)
+		cp += 2;
+	nwords = DOGLOB | DOTILDE | DOMARKDIRS;
+	if (*cp != EOS) {
+		/* probably a $FOO expansion */
+		*flagsp |= XCF_IS_NOSPACE;
+		/* this always results in at most one match */
+		nwords = 0;
+	}
+	expand(yylval.cp, &w, nwords);
 	XPput(w, NULL);
 	words = (char **)XPclose(w);
 
@@ -335,6 +405,9 @@ x_file_glob(int flags MKSH_A_UNUSED, char *toglob, char ***wordsp)
 		;
 	if (nwords == 1) {
 		struct stat statb;
+
+		/* Expand any tilde and drop all QCHAR for comparison */
+		toglob = x_glob_hlp_tilde_and_rem_qchar(toglob, false);
 
 		/*
 		 * Check if globbing failed (returned glob pattern),
@@ -382,7 +455,7 @@ static int
 x_command_glob(int flags, char *toglob, char ***wordsp)
 {
 	char *pat, *fpath;
-	int nwords;
+	size_t nwords;
 	XPtrV w;
 	struct block *l;
 
@@ -413,7 +486,7 @@ x_command_glob(int flags, char *toglob, char ***wordsp)
 		/* Sort by basename, then path order */
 		struct path_order_info *info, *last_info = NULL;
 		char **words = (char **)XPptrv(w);
-		int i, path_order = 0;
+		size_t i, path_order = 0;
 
 		info = (struct path_order_info *)
 		    alloc2(nwords, sizeof(struct path_order_info), ATEMP);
@@ -435,7 +508,7 @@ x_command_glob(int flags, char *toglob, char ***wordsp)
 	} else {
 		/* Sort and remove duplicate entries */
 		char **words = (char **)XPptrv(w);
-		int i, j;
+		size_t i, j;
 
 		qsort(words, nwords, sizeof(void *), xstrcmp);
 		for (i = j = 0; i < nwords - 1; i++) {
@@ -445,8 +518,7 @@ x_command_glob(int flags, char *toglob, char ***wordsp)
 				afree(words[i], ATEMP);
 		}
 		words[j++] = words[i];
-		nwords = j;
-		w.cur = (void **)&words[j];
+		w.len = nwords = j;
 	}
 
 	XPput(w, NULL);
@@ -533,7 +605,6 @@ x_cf_glob(int *flagsp, const char *buf, int buflen, int pos, int *startp,
 
 	if (len >= 0) {
 		char *toglob, *s;
-		bool saw_dollar = false, saw_glob = false;
 
 		/*
 		 * Given a string, copy it and possibly add a '*' to the end.
@@ -544,52 +615,45 @@ x_cf_glob(int *flagsp, const char *buf, int buflen, int pos, int *startp,
 
 		/*
 		 * If the pathname contains a wildcard (an unquoted '*',
-		 * '?', or '[') or parameter expansion ('$'), or a ~username
-		 * with no trailing slash, then it is globbed based on that
-		 * value (i.e., without the appended '*').
+		 * '?', or '[') or an extglob, then it is globbed based
+		 * on that value (i.e., without the appended '*'). Same
+		 * for parameter substitutions (as in “cat $HOME/.ss↹”)
+		 * without appending a trailing space (LP: #710539), as
+		 * well as for “~foo” (but not “~foo/”).
 		 */
 		for (s = toglob; *s; s++) {
 			if (*s == '\\' && s[1])
 				s++;
-			else if (*s == '$') {
-				/*
-				 * Do not append a space after the value
-				 * if expanding a parameter substitution
-				 * as in: “cat $HOME/.ss↹” (LP: #710539)
-				 */
-				saw_dollar = true;
-			} else if (*s == '?' || *s == '*' || *s == '[' ||
+			else if (*s == '?' || *s == '*' || *s == '[' ||
+			    *s == '$' ||
 			    /* ?() *() +() @() !() but two already checked */
 			    (s[1] == '(' /*)*/ &&
 			    (*s == '+' || *s == '@' || *s == '!'))) {
-				/* just expand based on the extglob */
-				saw_glob = true;
+				/*
+				 * just expand based on the extglob
+				 * or parameter
+				 */
+				goto dont_add_glob;
 			}
 		}
-		if (saw_glob) {
-			/*
-			 * do not append a glob, we already have a
-			 * glob or extglob; it works even if this is
-			 * a parameter expansion as we have a glob
-			 */
-			*flagsp |= XCF_IS_EXTGLOB;
-		} else if (saw_dollar ||
-		    (*toglob == '~' && !vstrchr(toglob, '/'))) {
-			/* do not append a glob, nor later a space */
-			*flagsp |= XCF_IS_SUBGLOB;
-		} else {
-			/* append a glob, this is not just a tilde */
-			toglob[len] = '*';
-			toglob[len + 1] = '\0';
+
+		if (*toglob == '~' && !vstrchr(toglob, '/')) {
+			/* neither for '~foo' (but '~foo/bar') */
+			*flagsp |= XCF_IS_NOSPACE;
+			goto dont_add_glob;
 		}
 
+		/* append a glob */
+		toglob[len] = '*';
+		toglob[len + 1] = '\0';
+ dont_add_glob:
 		/*
 		 * Expand (glob) it now.
 		 */
 
 		nwords = is_command ?
 		    x_command_glob(*flagsp, toglob, &words) :
-		    x_file_glob(*flagsp, toglob, &words);
+		    x_file_glob(flagsp, toglob, &words);
 		afree(toglob, ATEMP);
 	}
 	if (nwords == 0) {
@@ -624,6 +688,10 @@ x_longest_prefix(int nwords, char * const * words)
 				prefix_len = j;
 				break;
 			}
+	/* false for nwords==1 as 0 = words[0][prefix_len] then */
+	if (UTFMODE && prefix_len && (words[0][prefix_len] & 0xC0) == 0x80)
+		while (prefix_len && (words[0][prefix_len] & 0xC0) != 0xC0)
+			--prefix_len;
 	return (prefix_len);
 }
 
@@ -728,7 +796,7 @@ glob_path(int flags, const char *pat, XPtrV *wp, const char *lpath)
 
 		oldsize = XPsize(*wp);
 		/* mark dirs */
-		glob_str(Xstring(xs, xp), wp, 1);
+		glob_str(Xstring(xs, xp), wp, true);
 		newsize = XPsize(*wp);
 
 		/* Check that each match is executable... */
@@ -743,7 +811,7 @@ glob_path(int flags, const char *pat, XPtrV *wp, const char *lpath)
 			} else
 				afree(words[i], ATEMP);
 		}
-		wp->cur = (void **)&words[j];
+		wp->len = j;
 
 		if (!*sp++)
 			break;
@@ -843,22 +911,22 @@ static char *xcp;		/* current position */
 static char *xep;		/* current end */
 static char *xbp;		/* start of visible portion of input buffer */
 static char *xlp;		/* last char visible on screen */
-static int x_adj_ok;
+static bool x_adj_ok;
 /*
  * we use x_adj_done so that functions can tell
  * whether x_adjust() has been called while they are active.
  */
-static int x_adj_done;
+static int x_adj_done;		/* is incremented by x_adjust() */
 
-static int x_col;
 static int x_displen;
 static int x_arg;		/* general purpose arg */
 static bool x_arg_defaulted;	/* x_arg not explicitly set; defaulted to 1 */
 
-static int xlp_valid;
+static bool xlp_valid;		/* lastvis pointer was recalculated */
 
 static char **x_histp;		/* history position */
 static int x_nextcmd;		/* for newline-and-next */
+static char **x_histncp;	/* saved x_histp for " */
 static char *xmp;		/* mark pointer */
 static unsigned char x_last_command;
 static unsigned char (*x_tab)[X_TABSZ];	/* key definition */
@@ -874,9 +942,6 @@ static int x_curprefix;
 static char *macroptr;		/* bind key macro active? */
 #endif
 #if !MKSH_S_NOVI
-static int cur_col;		/* current column on line */
-static int pwidth;		/* width of prompt */
-static int prompt_trunc;	/* how much of prompt to truncate */
 static int winwidth;		/* width of window */
 static char *wbuf[2];		/* window buffers */
 static int wbuf_len;		/* length of window buffers (x_cols - 3) */
@@ -885,18 +950,20 @@ static char morec;		/* more character at right of window */
 static int lastref;		/* argument to last refresh() */
 static int holdlen;		/* length of holdbuf */
 #endif
-static int prompt_redraw;	/* 0 if newline forced after prompt */
+static int pwidth;		/* width of prompt */
+static int prompt_trunc;	/* how much of prompt to truncate or -1 */
+static int x_col;		/* current column on line */
 
 static int x_ins(const char *);
-static void x_delete(int, int);
-static int x_bword(void);
-static int x_fword(int);
+static void x_delete(size_t, bool);
+static size_t x_bword(void);
+static size_t x_fword(bool);
 static void x_goto(char *);
+static char *x_bs0(char *, char *) MKSH_A_PURE;
 static void x_bs3(char **);
 static int x_size_str(char *);
 static int x_size2(char *, char **);
 static void x_zots(char *);
-static void x_zotc2(int);
 static void x_zotc3(char **);
 static void x_load_hist(char **);
 static int x_search(char *, int, int);
@@ -906,8 +973,7 @@ static int x_search_dir(int);
 static int x_match(char *, char *);
 static void x_redraw(int);
 static void x_push(int);
-static char *x_mapin(const char *, Area *)
-    MKSH_A_NONNULL((__nonnull__ (1)));
+static char *x_mapin(const char *, Area *);
 static char *x_mapout(int);
 static void x_mapout2(int, char **);
 static void x_print(int, int);
@@ -922,6 +988,7 @@ static int x_fold_case(int);
 #endif
 static char *x_lastcp(void);
 static void do_complete(int, Comp_type);
+static size_t x_nb2nc(size_t) MKSH_A_PURE;
 
 static int unget_char = -1;
 
@@ -940,7 +1007,6 @@ enum emacs_funcs {
 static const struct x_ftab x_ftab[] = {
 #define EMACSFN_ITEMS
 #include "emacsfn.h"
-	{ 0, NULL, 0 }
 };
 
 static struct x_defbindings const x_defbindings[] = {
@@ -1040,8 +1106,17 @@ static struct x_defbindings const x_defbindings[] = {
 #endif
 };
 
-#ifdef MKSH_SMALL
-static void x_modified(void);
+static size_t
+x_nb2nc(size_t nb)
+{
+	char *cp;
+	size_t nc = 0;
+
+	for (cp = xcp; cp < (xcp + nb); ++nc)
+		cp += utf_ptradj(cp);
+	return (nc);
+}
+
 static void
 x_modified(void)
 {
@@ -1050,14 +1125,10 @@ x_modified(void)
 		modified = 1;
 	}
 }
+
+#ifdef MKSH_SMALL
 #define XFUNC_VALUE(f) (f)
 #else
-#define x_modified() do {			\
-	if (!modified) {			\
-		x_histp = histptr + 1;		\
-		modified = 1;			\
-	}					\
-} while (/* CONSTCOND */ 0)
 #define XFUNC_VALUE(f) (f & 0x7F)
 #endif
 
@@ -1093,32 +1164,28 @@ x_e_getmbc(char *sbuf)
 }
 
 static void
-x_init_prompt(void)
+x_init_prompt(bool doprint)
 {
-	x_col = promptlen(prompt);
-	x_adj_ok = 1;
-	prompt_redraw = 1;
-	if (x_col >= xx_cols)
-		x_col %= xx_cols;
-	x_displen = xx_cols - 2 - x_col;
-	x_adj_done = 0;
-
-	pprompt(prompt, 0);
-	if (x_displen < 1) {
-		x_col = 0;
-		x_displen = xx_cols - 2;
-		x_e_putc2('\n');
-		prompt_redraw = 0;
+	prompt_trunc = pprompt(prompt, doprint ? 0 : -1);
+	pwidth = prompt_trunc % x_cols;
+	prompt_trunc -= pwidth;
+	if ((mksh_uari_t)pwidth > ((mksh_uari_t)x_cols - 3 - MIN_EDIT_SPACE)) {
+		/* force newline after prompt */
+		prompt_trunc = -1;
+		pwidth = 0;
+		if (doprint)
+			x_e_putc2('\n');
 	}
 }
 
 static int
-x_emacs(char *buf, size_t len)
+x_emacs(char *buf)
 {
 	int c, i;
 	unsigned char f;
 
-	xbp = xbuf = buf; xend = buf + len;
+	xbp = xbuf = buf;
+	xend = buf + LINE;
 	xlp = xcp = xep = buf;
 	*xcp = 0;
 	xlp_valid = true;
@@ -1127,13 +1194,18 @@ x_emacs(char *buf, size_t len)
 	x_histp = histptr + 1;
 	x_last_command = XFUNC_error;
 
-	xx_cols = x_cols;
-	x_init_prompt();
+	x_init_prompt(true);
+	x_displen = (xx_cols = x_cols) - 2 - (x_col = pwidth);
+	x_adj_done = 0;
+	x_adj_ok = true;
 
+	x_histncp = NULL;
 	if (x_nextcmd >= 0) {
 		int off = source->line - x_nextcmd;
-		if (histptr - history >= off)
+		if (histptr - history >= off) {
 			x_load_hist(histptr - off);
+			x_histncp = x_histp;
+		}
 		x_nextcmd = -1;
 	}
 	editmode = 1;
@@ -1281,7 +1353,7 @@ x_ins(const char *s)
 	 */
 	xlp_valid = false;
 	x_lastcp();
-	x_adj_ok = (xcp >= xlp);
+	x_adj_ok = tobool(xcp >= xlp);
 	x_zots(cp);
 	/* has x_adjust() been called? */
 	if (adj == x_adj_done) {
@@ -1292,14 +1364,14 @@ x_ins(const char *s)
 	}
 	if (xlp == xep - 1)
 		x_redraw(xx_cols);
-	x_adj_ok = 1;
+	x_adj_ok = true;
 	return (0);
 }
 
 static int
 x_del_back(int c MKSH_A_UNUSED)
 {
-	int i = 0;
+	ssize_t i = 0;
 
 	if (xcp == xbuf) {
 		x_e_putc2(7);
@@ -1316,10 +1388,10 @@ static int
 x_del_char(int c MKSH_A_UNUSED)
 {
 	char *cp, *cp2;
-	int i = 0;
+	size_t i = 0;
 
 	cp = xcp;
-	while (i < x_arg) {
+	while (i < (size_t)x_arg) {
 		utf_ptradjx(cp, cp2);
 		if (cp2 > xep)
 			break;
@@ -1337,9 +1409,9 @@ x_del_char(int c MKSH_A_UNUSED)
 
 /* Delete nc chars to the right of the cursor (including cursor position) */
 static void
-x_delete(int nc, int push)
+x_delete(size_t nc, bool push)
 {
-	int i, nb, nw;
+	size_t i, nb, nw;
 	char *cp;
 
 	if (nc == 0)
@@ -1376,7 +1448,7 @@ x_delete(int nc, int push)
 	/* Copies the NUL */
 	memmove(xcp, xcp + nb, xep - xcp + 1);
 	/* don't redraw */
-	x_adj_ok = 0;
+	x_adj_ok = false;
 	xlp_valid = false;
 	x_zots(xcp);
 	/*
@@ -1396,7 +1468,7 @@ x_delete(int nc, int push)
 			x_e_putc2('\b');
 	}
 	/*x_goto(xcp);*/
-	x_adj_ok = 1;
+	x_adj_ok = true;
 	xlp_valid = false;
 	cp = x_lastcp();
 	while (cp > xcp)
@@ -1423,21 +1495,21 @@ x_mv_bword(int c MKSH_A_UNUSED)
 static int
 x_mv_fword(int c MKSH_A_UNUSED)
 {
-	x_fword(1);
+	x_fword(true);
 	return (KSTD);
 }
 
 static int
 x_del_fword(int c MKSH_A_UNUSED)
 {
-	x_delete(x_fword(0), true);
+	x_delete(x_fword(false), true);
 	return (KSTD);
 }
 
-static int
+static size_t
 x_bword(void)
 {
-	int nc = 0, nb = 0;
+	size_t nb = 0;
 	char *cp = xcp;
 
 	if (cp == xbuf) {
@@ -1455,16 +1527,14 @@ x_bword(void)
 		}
 	}
 	x_goto(cp);
-	for (cp = xcp; cp < (xcp + nb); ++nc)
-		cp += utf_ptradj(cp);
-	return (nc);
+	return (x_nb2nc(nb));
 }
 
-static int
-x_fword(int move)
+static size_t
+x_fword(bool move)
 {
-	int nc = 0;
-	char *cp = xcp, *cp2;
+	size_t nc;
+	char *cp = xcp;
 
 	if (cp == xep) {
 		x_e_putc2(7);
@@ -1476,8 +1546,7 @@ x_fword(int move)
 		while (cp != xep && !is_mfs(*cp))
 			cp++;
 	}
-	for (cp2 = xcp; cp2 < cp; ++nc)
-		cp2 += utf_ptradj(cp2);
+	nc = x_nb2nc(cp - xcp);
 	if (move)
 		x_goto(cp);
 	return (nc);
@@ -1486,9 +1555,7 @@ x_fword(int move)
 static void
 x_goto(char *cp)
 {
-	if (UTFMODE)
-		while ((cp > xbuf) && ((*cp & 0xC0) == 0x80))
-			--cp;
+	cp = cp >= xep ? xep : x_bs0(cp, xbuf);
 	if (cp < xbp || cp >= utf_skipcols(xbp, x_displen)) {
 		/* we are heading off screen */
 		xcp = cp;
@@ -1504,16 +1571,22 @@ x_goto(char *cp)
 	}
 }
 
+static char *
+x_bs0(char *cp, char *lower_bound)
+{
+	if (UTFMODE)
+		while ((!lower_bound || (cp > lower_bound)) &&
+		    ((*(unsigned char *)cp & 0xC0) == 0x80))
+			--cp;
+	return (cp);
+}
+
 static void
 x_bs3(char **p)
 {
 	int i;
 
-	(*p)--;
-	if (UTFMODE)
-		while (((unsigned char)**p & 0xC0) == 0x80)
-			(*p)--;
-
+	*p = x_bs0((*p) - 1, NULL);
 	i = x_size2(*p, NULL);
 	while (i--)
 		x_e_putc2('\b');
@@ -1531,7 +1604,7 @@ x_size_str(char *cp)
 static int
 x_size2(char *cp, char **dcp)
 {
-	int c = *(unsigned char *)cp;
+	uint8_t c = *(unsigned char *)cp;
 
 	if (UTFMODE && (c > 0x7F))
 		return (utf_widthadj(cp, (const char **)dcp));
@@ -1540,7 +1613,7 @@ x_size2(char *cp, char **dcp)
 	if (c == '\t')
 		/* Kludge, tabs are always four spaces. */
 		return (4);
-	if (c < ' ' || c == 0x7f)
+	if (ISCTRL(c) && /* but not C1 */ c < 0x80)
 		/* control unsigned char */
 		return (2);
 	return (1);
@@ -1552,21 +1625,8 @@ x_zots(char *str)
 	int adj = x_adj_done;
 
 	x_lastcp();
-	while (*str && str < xlp && adj == x_adj_done)
+	while (*str && str < xlp && x_col < xx_cols && adj == x_adj_done)
 		x_zotc3(&str);
-}
-
-static void
-x_zotc2(int c)
-{
-	if (c == '\t') {
-		/* Kludge, tabs are always four spaces. */
-		x_e_puts("    ");
-	} else if (c < ' ' || c == 0x7f) {
-		x_e_putc2('^');
-		x_e_putc2(UNCTRL(c));
-	} else
-		x_e_putc2(c);
 }
 
 static void
@@ -1578,7 +1638,7 @@ x_zotc3(char **cp)
 		/* Kludge, tabs are always four spaces. */
 		x_e_puts("    ");
 		(*cp)++;
-	} else if (c < ' ' || c == 0x7f) {
+	} else if (ISCTRL(c) && /* but not C1 */ c < 0x80) {
 		x_e_putc2('^');
 		x_e_putc2(UNCTRL(c));
 		(*cp)++;
@@ -1690,7 +1750,10 @@ x_newline(int c MKSH_A_UNUSED)
 static int
 x_end_of_text(int c MKSH_A_UNUSED)
 {
-	x_zotc2(edchars.eof);
+	char tmp = edchars.eof;
+	char *cp = &tmp;
+
+	x_zotc3(&cp);
 	x_putc('\r');
 	x_putc('\n');
 	x_flush();
@@ -1747,7 +1810,7 @@ x_load_hist(char **hp)
 	char *sp = NULL;
 
 	if (hp == histptr + 1) {
-		sp = holdbuf;
+		sp = holdbufp;
 		modified = 0;
 	} else if (hp < history || hp > histptr) {
 		x_e_putc2(7);
@@ -1758,7 +1821,7 @@ x_load_hist(char **hp)
 	x_histp = hp;
 	oldsize = x_size_str(xbuf);
 	if (modified)
-		strlcpy(holdbuf, xbuf, sizeof(holdbuf));
+		strlcpy(holdbufp, xbuf, LINE);
 	strlcpy(xbuf, sp, xend - xbuf);
 	xbp = xbuf;
 	xep = xcp = xbuf + strlen(xbuf);
@@ -1773,7 +1836,10 @@ x_load_hist(char **hp)
 static int
 x_nl_next_com(int c MKSH_A_UNUSED)
 {
-	x_nextcmd = source->line - (histptr - x_histp) + 1;
+	if (!x_histncp || (x_histp != x_histncp && x_histp != histptr + 1))
+		/* fresh start of ^O */
+		x_histncp = x_histp;
+	x_nextcmd = source->line - (histptr - x_histncp) + 1;
 	return (x_newline('\n'));
 }
 
@@ -1791,7 +1857,7 @@ static int
 x_search_hist(int c)
 {
 	int offset = -1;	/* offset of match in xbuf, else -1 */
-	char pat[256 + 1];	/* pattern buffer */
+	char pat[80 + 1];	/* pattern buffer */
 	char *p = pat;
 	unsigned char f;
 
@@ -1840,7 +1906,7 @@ x_search_hist(int c)
 		} else if (f == XFUNC_insert) {
 			/* add char to pattern */
 			/* overflow check... */
-			if (p >= &pat[sizeof(pat) - 1]) {
+			if ((size_t)(p - pat) >= sizeof(pat) - 1) {
 				x_e_putc2(7);
 				continue;
 			}
@@ -2000,31 +2066,22 @@ x_cls(int c MKSH_A_UNUSED)
 static void
 x_redraw(int limit)
 {
-	int i, j, x_trunc = 0;
+	int i, j;
 	char *cp;
 
-	x_adj_ok = 0;
+	x_adj_ok = false;
 	if (limit == -1)
 		x_e_putc2('\n');
 	else
 		x_e_putc2('\r');
 	x_flush();
 	if (xbp == xbuf) {
-		x_col = promptlen(prompt);
-		if (x_col >= xx_cols)
-			x_trunc = (x_col / xx_cols) * xx_cols;
-		if (prompt_redraw)
-			pprompt(prompt, x_trunc);
+		if (prompt_trunc != -1)
+			pprompt(prompt, prompt_trunc);
+		x_col = pwidth;
 	}
-	if (x_col >= xx_cols)
-		x_col %= xx_cols;
 	x_displen = xx_cols - 2 - x_col;
-	if (x_displen < 1) {
-		x_col = 0;
-		x_displen = xx_cols - 2;
-	}
 	xlp_valid = false;
-	x_lastcp();
 	x_zots(xbp);
 	if (xbp != xbuf || xep > xlp)
 		limit = xx_cols;
@@ -2064,7 +2121,7 @@ x_redraw(int limit)
 	cp = xlp;
 	while (cp > xcp)
 		x_bs3(&cp);
-	x_adj_ok = 1;
+	x_adj_ok = true;
 	return;
 }
 
@@ -2160,20 +2217,18 @@ x_meta2(int c MKSH_A_UNUSED)
 static int
 x_kill(int c MKSH_A_UNUSED)
 {
-	int col = xcp - xbuf;
-	int lastcol = xep - xbuf;
-	int ndel;
+	size_t col = xcp - xbuf;
+	size_t lastcol = xep - xbuf;
+	size_t ndel, narg;
 
-	if (x_arg_defaulted)
-		x_arg = lastcol;
-	else if (x_arg > lastcol)
-		x_arg = lastcol;
-	ndel = x_arg - col;
-	if (ndel < 0) {
-		x_goto(xbuf + x_arg);
-		ndel = -ndel;
-	}
-	x_delete(ndel, true);
+	if (x_arg_defaulted || (narg = x_arg) > lastcol)
+		narg = lastcol;
+	if (narg < col) {
+		x_goto(xbuf + narg);
+		ndel = col - narg;
+	} else
+		ndel = narg - col;
+	x_delete(x_nb2nc(ndel), true);
 	return (KSTD);
 }
 
@@ -2221,7 +2276,7 @@ x_meta_yank(int c MKSH_A_UNUSED)
 	}
 	len = strlen(killstack[killtp]);
 	x_goto(xcp - len);
-	x_delete(len, false);
+	x_delete(x_nb2nc(len), false);
 	do {
 		if (killtp == 0)
 			killtp = KILLSIZE - 1;
@@ -2303,15 +2358,13 @@ x_mapin(const char *cp, Area *ap)
 {
 	char *news, *op;
 
-	/* for clang's static analyser, the nonnull attribute isn't enough */
-	mkssert(cp != NULL);
-
 	strdupx(news, cp, ap);
 	op = news;
 	while (*cp) {
 		/* XXX -- should handle \^ escape? */
 		if (*cp == '^') {
 			cp++;
+			/*XXX or ^^ escape? this is ugly. */
 			if (*cp >= '?')
 				/* includes '?'; ASCII */
 				*op++ = CTRL(*cp);
@@ -2333,7 +2386,7 @@ x_mapout2(int c, char **buf)
 {
 	char *p = *buf;
 
-	if (c < ' ' || c == 0x7f) {
+	if (ISCTRL(c)) {
 		*p++ = '^';
 		*p++ = UNCTRL(c);
 	} else
@@ -2398,8 +2451,7 @@ x_bind(const char *a1, const char *a2,
 	/* List function names */
 	if (list) {
 		for (f = 0; f < NELEM(x_ftab); f++)
-			if (x_ftab[f].xf_name &&
-			    !(x_ftab[f].xf_flags & XF_NOBIND))
+			if (!(x_ftab[f].xf_flags & XF_NOBIND))
 				shprintf("%s\n", x_ftab[f].xf_name);
 		return (0);
 	}
@@ -2437,7 +2489,7 @@ x_bind(const char *a1, const char *a2,
 		char msg[256];
 		const char *c = a1;
 		m1 = msg;
-		while (*c && m1 < (msg + sizeof(msg) - 3))
+		while (*c && (size_t)(m1 - msg) < sizeof(msg) - 3)
 			x_mapout2(*c++, &m1);
 		bi_errorf("%s: %s", "too long key sequence", msg);
 		return (1);
@@ -2460,8 +2512,7 @@ x_bind(const char *a1, const char *a2,
 #endif
 	} else {
 		for (f = 0; f < NELEM(x_ftab); f++)
-			if (x_ftab[f].xf_name &&
-			    strcmp(x_ftab[f].xf_name, a2) == 0)
+			if (!strcmp(x_ftab[f].xf_name, a2))
 				break;
 		if (f == NELEM(x_ftab) || x_ftab[f].xf_flags & XF_NOBIND) {
 			bi_errorf("%s: %s %s", a2, "no such", Tfunction);
@@ -2495,37 +2546,16 @@ x_bind(const char *a1, const char *a2,
 }
 
 static void
-x_init_emacs(void)
-{
-	int i, j;
-
-	ainit(AEDIT);
-	x_nextcmd = -1;
-
-	x_tab = alloc2(X_NTABS, sizeof(*x_tab), AEDIT);
-	for (j = 0; j < X_TABSZ; j++)
-		x_tab[0][j] = XFUNC_insert;
-	for (i = 1; i < X_NTABS; i++)
-		for (j = 0; j < X_TABSZ; j++)
-			x_tab[i][j] = XFUNC_error;
-	for (i = 0; i < (int)NELEM(x_defbindings); i++)
-		x_tab[x_defbindings[i].xdb_tab][x_defbindings[i].xdb_char]
-		    = x_defbindings[i].xdb_func;
-
-#ifndef MKSH_SMALL
-	x_atab = alloc2(X_NTABS, sizeof(*x_atab), AEDIT);
-	for (i = 1; i < X_NTABS; i++)
-		for (j = 0; j < X_TABSZ; j++)
-			x_atab[i][j] = NULL;
-#endif
-}
-
-static void
 bind_if_not_bound(int p, int k, int func)
 {
-	/* Has user already bound this key? If so, don't override it */
-	if (x_bound[((p) * X_TABSZ + (k)) / 8] &
-	    (1 << (((p) * X_TABSZ + (k)) % 8)))
+	int t;
+
+	/*
+	 * Has user already bound this key?
+	 * If so, do not override it.
+	 */
+	t = p * X_TABSZ + k;
+	if (x_bound[t >> 3] & (1 << (t & 7)))
 		return;
 
 	x_tab[p][k] = func;
@@ -2541,7 +2571,7 @@ x_set_mark(int c MKSH_A_UNUSED)
 static int
 x_kill_region(int c MKSH_A_UNUSED)
 {
-	int rsize;
+	size_t rsize;
 	char *xr;
 
 	if (xmp == NULL) {
@@ -2556,7 +2586,7 @@ x_kill_region(int c MKSH_A_UNUSED)
 		xr = xmp;
 	}
 	x_goto(xr);
-	x_delete(rsize, true);
+	x_delete(x_nb2nc(rsize), true);
 	xmp = xr;
 	return (KSTD);
 }
@@ -2649,7 +2679,7 @@ x_expand(int c MKSH_A_UNUSED)
 		return (KSTD);
 	}
 	x_goto(xbuf + start);
-	x_delete(end - start, false);
+	x_delete(x_nb2nc(end - start), false);
 
 	i = 0;
 	while (i < nwords) {
@@ -2673,7 +2703,7 @@ do_complete(
 {
 	char **words;
 	int start, end, nlen, olen, nwords;
-	bool completed = false;
+	bool completed;
 
 	nwords = x_cf_glob(&flags, xbuf, xep - xbuf, xcp - xbuf,
 	    &start, &end, &words);
@@ -2691,30 +2721,56 @@ do_complete(
 	}
 	olen = end - start;
 	nlen = x_longest_prefix(nwords, words);
-	/* complete */
-	if (nwords == 1 || nlen > olen) {
-		x_goto(xbuf + start);
-		x_delete(olen, false);
-		x_escape(words[0], nlen, x_do_ins);
-		x_adjust();
+	if (nwords == 1) {
+		/*
+		 * always complete single matches;
+		 * any expansion of parameter substitution
+		 * is always at most one result, too
+		 */
 		completed = true;
+	} else {
+		char *unescaped;
+
+		/* make a copy of the original string part */
+		strndupx(unescaped, xbuf + start, olen, ATEMP);
+
+		/* expand any tilde and unescape the string for comparison */
+		unescaped = x_glob_hlp_tilde_and_rem_qchar(unescaped, true);
+
+		/*
+		 * match iff entire original string is part of the
+		 * longest prefix, implying the latter is at least
+		 * the same size (after unescaping)
+		 */
+		completed = !strncmp(words[0], unescaped, strlen(unescaped));
+
+		afree(unescaped, ATEMP);
 	}
+	if (type == CT_COMPLIST && nwords > 1) {
+		/*
+		 * print expansions, since we didn't get back
+		 * just a single match
+		 */
+		x_print_expansions(nwords, words,
+		    tobool(flags & XCF_IS_COMMAND));
+	}
+	if (completed) {
+		/* expand on the command line */
+		xmp = NULL;
+		xcp = xbuf + start;
+		xep -= olen;
+		memmove(xcp, xcp + olen, xep - xcp + 1);
+		x_escape(words[0], nlen, x_do_ins);
+	}
+	x_adjust();
 	/*
 	 * append a space if this is a single non-directory match
 	 * and not a parameter or homedir substitution
 	 */
 	if (nwords == 1 && words[0][nlen - 1] != '/' &&
-	    !(flags & XCF_IS_SUBGLOB)) {
+	    !(flags & XCF_IS_NOSPACE)) {
 		x_ins(" ");
-		completed = true;
 	}
-	if (type == CT_COMPLIST && !completed) {
-		x_print_expansions(nwords, words,
-		    tobool(flags & XCF_IS_COMMAND));
-		completed = true;
-	}
-	if (completed)
-		x_redraw(0);
 
 	x_free_words(nwords, words);
 }
@@ -2736,16 +2792,42 @@ do_complete(
 static void
 x_adjust(void)
 {
-	/* flag the fact that we were called. */
+	int col_left, n;
+
+	/* flag the fact that we were called */
 	x_adj_done++;
+
 	/*
-	 * we had a problem if the prompt length > xx_cols / 2
+	 * calculate the amount of columns we need to "go back"
+	 * from xcp to set xbp to (but never < xbuf) to 2/3 of
+	 * the display width; take care of pwidth though
 	 */
-	if ((xbp = xcp - (x_displen / 2)) < xbuf)
-		xbp = xbuf;
-	if (UTFMODE)
-		while ((xbp > xbuf) && ((*xbp & 0xC0) == 0x80))
-			--xbp;
+	if ((col_left = xx_cols * 2 / 3) < MIN_EDIT_SPACE) {
+		/*
+		 * cowardly refuse to do anything
+		 * if the available space is too small;
+		 * fall back to dumb pdksh code
+		 */
+		if ((xbp = xcp - (x_displen / 2)) < xbuf)
+			xbp = xbuf;
+		/* elide UTF-8 fixup as penalty */
+		goto x_adjust_out;
+	}
+
+	/* fix up xbp to just past a character end first */
+	xbp = xcp >= xep ? xep : x_bs0(xcp, xbuf);
+	/* walk backwards */
+	while (xbp > xbuf && col_left > 0) {
+		xbp = x_bs0(xbp - 1, xbuf);
+		col_left -= (n = x_size2(xbp, NULL));
+	}
+	/* check if we hit the prompt */
+	if (xbp == xbuf && xcp != xbuf && col_left >= 0 && col_left < pwidth) {
+		/* so we did; force scrolling occurs */
+		xbp += utf_ptradj(xbp);
+	}
+
+ x_adjust_out:
 	xlp_valid = false;
 	x_redraw(xx_cols);
 	x_flush();
@@ -3083,7 +3165,7 @@ x_fold_lower(int c MKSH_A_UNUSED)
 	return (x_fold_case('L'));
 }
 
-/* Lowercase N(1) words */
+/* Titlecase N(1) words */
 static int
 x_fold_capitalise(int c MKSH_A_UNUSED)
 {
@@ -3095,8 +3177,8 @@ x_fold_capitalise(int c MKSH_A_UNUSED)
  *	x_fold_case - convert word to UPPER/lower/Capital case
  *
  * DESCRIPTION:
- *	This function is used to implement M-U,M-u,M-L,M-l,M-C and M-c
- *	to UPPER case, lower case or Capitalise words.
+ *	This function is used to implement M-U/M-u, M-L/M-l, M-C/M-c
+ *	to UPPER CASE, lower case or Capitalise Words.
  *
  * RETURN VALUE:
  *	None
@@ -3239,13 +3321,11 @@ x_mode(bool onoff)
 		if (edchars.quit >= 0)
 			bind_if_not_bound(0, edchars.quit, XFUNC_noop);
 	} else
-		tcsetattr(tty_fd, TCSADRAIN, &tty_state);
+		mksh_tcset(tty_fd, &tty_state);
 }
 
 #if !MKSH_S_NOVI
 /* +++ vi editing mode +++ */
-
-#define Ctrl(c)		(c&0x1f)
 
 struct edstate {
 	char *cbuf;
@@ -3265,9 +3345,9 @@ static void yank_range(int, int);
 static int bracktype(int);
 static void save_cbuf(void);
 static void restore_cbuf(void);
-static int putbuf(const char *, ssize_t, int);
+static int putbuf(const char *, ssize_t, bool);
 static void del_range(int, int);
-static int findch(int, int, int, int);
+static int findch(int, int, bool, bool) MKSH_A_PURE;
 static int forwword(int);
 static int backword(int);
 static int endword(int);
@@ -3275,18 +3355,19 @@ static int Forwword(int);
 static int Backword(int);
 static int Endword(int);
 static int grabhist(int, int);
-static int grabsearch(int, int, int, char *);
+static int grabsearch(int, int, int, const char *);
 static void redraw_line(bool);
 static void refresh(int);
 static int outofwin(void);
 static void rewindow(void);
-static int newcol(int, int);
+static int newcol(unsigned char, int);
 static void display(char *, char *, int);
 static void ed_mov_opt(int, char *);
 static int expand_word(int);
 static int complete_word(int, int);
 static int print_expansions(struct edstate *, int);
-#define char_len(c)	((c) < ' ' || (c) == 0x7F ? 2 : 1)
+#define char_len(c)	((ISCTRL((unsigned char)c) && \
+			/* but not C1 */ (unsigned char)c < 0x80) ? 2 : 1)
 static void x_vi_zotc(int);
 static void vi_error(void);
 static void vi_macro_reset(void);
@@ -3331,11 +3412,11 @@ static const unsigned char classify[128] = {
 /* 8	@	A	B	C	D	E	F	G	*/
 	vC|vX,	vC,	vM,	vC,	vC,	vM,	vM|vX,	vC|vU|vZ,
 /* 9	H	I	J	K	L	M	N	O	*/
-	0,	vC,	0,	0,	0,	0,	vC|vU,	0,
+	0,	vC,	0,	0,	0,	0,	vC|vU,	vU,
 /* A	P	Q	R	S	T	U	V	W	*/
 	vC,	0,	vC,	vC,	vM|vX,	vC,	0,	vM,
 /* B	X	Y	Z	[	\	]	^	_	*/
-	vC,	vC|vU,	0,	0,	vC|vZ,	0,	vM,	vC|vZ,
+	vC,	vC|vU,	0,	vU,	vC|vZ,	0,	vM,	vC|vZ,
 /* C	`	a	b	c	d	e	f	g	*/
 	0,	vC,	vM,	vE,	vE,	vM,	vM|vX,	vC|vZ,
 /* D	h	i	j	k	l	m	n	o	*/
@@ -3363,25 +3444,24 @@ static const unsigned char classify[128] = {
 #define VLIT		8		/* ^V */
 #define VSEARCH		9		/* /, ? */
 #define VVERSION	10		/* <ESC> ^V */
-
-static char		undocbuf[LINE];
+#define VPREFIX2	11		/* ^[[ and ^[O in insert mode */
 
 static struct edstate	*save_edstate(struct edstate *old);
 static void		restore_edstate(struct edstate *old, struct edstate *news);
 static void		free_edstate(struct edstate *old);
 
 static struct edstate	ebuf;
-static struct edstate	undobuf = { undocbuf, 0, LINE, 0, 0 };
+static struct edstate	undobuf;
 
-static struct edstate	*es;			/* current editor state */
+static struct edstate	*es;		/* current editor state */
 static struct edstate	*undo;
 
-static char ibuf[LINE];			/* input buffer */
-static int first_insert;		/* set when starting in insert mode */
+static char *ibuf;			/* input buffer */
+static bool first_insert;		/* set when starting in insert mode */
 static int saved_inslen;		/* saved inslen for first insert */
 static int inslen;			/* length of input buffer */
 static int srchlen;			/* length of current search pattern */
-static char ybuf[LINE];			/* yank buffer */
+static char *ybuf;			/* yank buffer */
 static int yanklen;			/* length of yank buffer */
 static int fsavecmd = ' ';		/* last find command */
 static int fsavech;			/* character to find */
@@ -3389,7 +3469,7 @@ static char lastcmd[MAXVICMD];		/* last non-move command */
 static int lastac;			/* argcnt for lastcmd */
 static int lastsearch = ' ';		/* last search command */
 static char srchpat[SRCHLEN];		/* last search pattern */
-static int insert;			/* non-zero in insert mode */
+static int insert;			/* <>0 in insert mode */
 static int hnum;			/* position in history */
 static int ohnum;			/* history line copied (after mod) */
 static int hlast;			/* 1 past last position in history */
@@ -3415,7 +3495,7 @@ static enum expand_mode {
 } expanded;
 
 static int
-x_vi(char *buf, size_t len)
+x_vi(char *buf)
 {
 	int c;
 
@@ -3423,35 +3503,29 @@ x_vi(char *buf, size_t len)
 	ohnum = hnum = hlast = histnum(-1) + 1;
 	insert = INSERT;
 	saved_inslen = inslen;
-	first_insert = 1;
+	first_insert = true;
 	inslen = 0;
 	vi_macro_reset();
 
+	ebuf.cbuf = buf;
+	if (undobuf.cbuf == NULL) {
+		ibuf = alloc(LINE, AEDIT);
+		ybuf = alloc(LINE, AEDIT);
+		undobuf.cbuf = alloc(LINE, AEDIT);
+	}
+	undobuf.cbufsize = ebuf.cbufsize = LINE;
+	undobuf.linelen = ebuf.linelen = 0;
+	undobuf.cursor = ebuf.cursor = 0;
+	undobuf.winleft = ebuf.winleft = 0;
 	es = &ebuf;
-	es->cbuf = buf;
 	undo = &undobuf;
-	undo->cbufsize = es->cbufsize = len > LINE ? LINE : len;
 
-	es->linelen = undo->linelen = 0;
-	es->cursor = undo->cursor = 0;
-	es->winleft = undo->winleft = 0;
+	x_init_prompt(true);
+	x_col = pwidth;
 
-	cur_col = promptlen(prompt);
-	prompt_trunc = (cur_col / x_cols) * x_cols;
-	cur_col -= prompt_trunc;
-
-	pprompt(prompt, 0);
-	if (cur_col > x_cols - 3 - MIN_EDIT_SPACE) {
-		prompt_redraw = cur_col = 0;
-		x_putc('\n');
-	} else
-		prompt_redraw = 1;
-	pwidth = cur_col;
-
-	if (!wbuf_len || wbuf_len != x_cols - 3) {
-		wbuf_len = x_cols - 3;
-		wbuf[0] = aresize(wbuf[0], wbuf_len, APERM);
-		wbuf[1] = aresize(wbuf[1], wbuf_len, APERM);
+	if (wbuf_len != x_cols - 3 && ((wbuf_len = x_cols - 3))) {
+		wbuf[0] = aresize(wbuf[0], wbuf_len, AEDIT);
+		wbuf[1] = aresize(wbuf[1], wbuf_len, AEDIT);
 	}
 	if (wbuf_len) {
 		memset(wbuf[0], ' ', wbuf_len);
@@ -3467,7 +3541,7 @@ x_vi(char *buf, size_t len)
 	x_flush();
 	while (/* CONSTCOND */ 1) {
 		if (macro.p) {
-			c = *macro.p++;
+			c = (unsigned char)*macro.p++;
 			/* end of current macro? */
 			if (!c) {
 				/* more macros left to finish? */
@@ -3508,11 +3582,11 @@ x_vi(char *buf, size_t len)
 	x_putc('\n');
 	x_flush();
 
-	if (c == -1 || (ssize_t)len <= es->linelen)
+	if (c == -1 || (ssize_t)LINE <= es->linelen)
 		return (-1);
 
 	if (es->cbuf != buf)
-		memmove(buf, es->cbuf, es->linelen);
+		memcpy(buf, es->cbuf, es->linelen);
 
 	buf[es->linelen++] = '\n';
 
@@ -3529,7 +3603,7 @@ vi_hook(int ch)
 
 	case VNORMAL:
 		if (insert != 0) {
-			if (ch == Ctrl('v')) {
+			if (ch == CTRL('v')) {
 				state = VLIT;
 				ch = '^';
 			}
@@ -3563,10 +3637,8 @@ vi_hook(int ch)
 					save_cbuf();
 					es->cursor = 0;
 					es->linelen = 0;
-					if (ch == '/') {
-						if (putbuf("/", 1, 0) != 0)
-							return (-1);
-					} else if (putbuf("?", 1, 0) != 0)
+					if (putbuf(ch == '/' ? "/" : "?", 1,
+					    false) != 0)
 						return (-1);
 					refresh(0);
 				}
@@ -3575,7 +3647,7 @@ vi_hook(int ch)
 					es->cursor = 0;
 					es->linelen = 0;
 					putbuf(KSH_VERSION,
-					    strlen(KSH_VERSION), 0);
+					    strlen(KSH_VERSION), false);
 					refresh(0);
 				}
 			}
@@ -3643,7 +3715,7 @@ vi_hook(int ch)
 		break;
 
 	case VXCH:
-		if (ch == Ctrl('['))
+		if (ch == CTRL('['))
 			state = VNORMAL;
 		else {
 			curcmd[cmdlen++] = ch;
@@ -3652,7 +3724,7 @@ vi_hook(int ch)
 		break;
 
 	case VSEARCH:
-		if (ch == '\r' || ch == '\n' /*|| ch == Ctrl('[')*/ ) {
+		if (ch == '\r' || ch == '\n' /*|| ch == CTRL('[')*/ ) {
 			restore_cbuf();
 			/* Repeat last search? */
 			if (srchlen == 0) {
@@ -3667,10 +3739,10 @@ vi_hook(int ch)
 				memcpy(srchpat, locpat, srchlen + 1);
 			}
 			state = VCMD;
-		} else if (ch == edchars.erase || ch == Ctrl('h')) {
+		} else if (ch == edchars.erase || ch == CTRL('h')) {
 			if (srchlen != 0) {
 				srchlen--;
-				es->linelen -= char_len((unsigned char)locpat[srchlen]);
+				es->linelen -= char_len(locpat[srchlen]);
 				es->cursor = es->linelen;
 				refresh(0);
 				return (0);
@@ -3685,10 +3757,10 @@ vi_hook(int ch)
 			refresh(0);
 			return (0);
 		} else if (ch == edchars.werase) {
-			int i, n = srchlen;
+			unsigned int i, n;
 			struct edstate new_es, *save_es;
 
-			new_es.cursor = n;
+			new_es.cursor = srchlen;
 			new_es.cbuf = locpat;
 
 			save_es = es;
@@ -3696,9 +3768,10 @@ vi_hook(int ch)
 			n = backword(1);
 			es = save_es;
 
-			for (i = srchlen; --i >= n; )
-				es->linelen -= char_len((unsigned char)locpat[i]);
-			srchlen = n;
+			i = (unsigned)srchlen;
+			while (--i >= n)
+				es->linelen -= char_len(locpat[i]);
+			srchlen = (int)n;
 			es->cursor = es->linelen;
 			refresh(0);
 			return (0);
@@ -3707,11 +3780,12 @@ vi_hook(int ch)
 				vi_error();
 			else {
 				locpat[srchlen++] = ch;
-				if (ch < ' ' || ch == 0x7f) {
-					if (es->linelen + 2 > es->cbufsize)
+				if (ISCTRL(ch) && /* but not C1 */ ch < 0x80) {
+					if ((size_t)es->linelen + 2 >
+					    (size_t)es->cbufsize)
 						vi_error();
 					es->cbuf[es->linelen++] = '^';
-					es->cbuf[es->linelen++] = ch ^ '@';
+					es->cbuf[es->linelen++] = UNCTRL(ch);
 				} else {
 					if (es->linelen >= es->cbufsize)
 						vi_error();
@@ -3723,10 +3797,35 @@ vi_hook(int ch)
 			return (0);
 		}
 		break;
+
+	case VPREFIX2:
+		state = VFAIL;
+		switch (ch) {
+		case 'A':
+			/* the cursor may not be at the BOL */
+			if (!es->cursor)
+				break;
+			/* nor further in the line than we can search for */
+			if ((size_t)es->cursor >= sizeof(srchpat) - 1)
+				es->cursor = sizeof(srchpat) - 2;
+			/* anchor the search pattern */
+			srchpat[0] = '^';
+			/* take the current line up to the cursor */
+			memmove(srchpat + 1, es->cbuf, es->cursor);
+			srchpat[es->cursor + 1] = '\0';
+			/* set a magic flag */
+			argc1 = 2 + (int)es->cursor;
+			/* and emulate a backwards history search */
+			lastsearch = '/';
+			*curcmd = 'n';
+			goto pseudo_VCMD;
+		}
+		break;
 	}
 
 	switch (state) {
 	case VCMD:
+ pseudo_VCMD:
 		state = VNORMAL;
 		switch (vi_cmd(argc1, curcmd)) {
 		case -1:
@@ -3797,7 +3896,7 @@ nextstate(int ch)
 		return (VXCH);
 	else if (ch == '.')
 		return (VREDO);
-	else if (ch == Ctrl('v'))
+	else if (ch == CTRL('v'))
 		return (VVERSION);
 	else if (is_cmd(ch))
 		return (VCMD);
@@ -3810,7 +3909,7 @@ vi_insert(int ch)
 {
 	int tcursor;
 
-	if (ch == edchars.erase || ch == Ctrl('h')) {
+	if (ch == edchars.erase || ch == CTRL('h')) {
 		if (insert == REPLACE) {
 			if (es->cursor == undo->cursor) {
 				vi_error();
@@ -3867,7 +3966,7 @@ vi_insert(int ch)
 	 * buffer (if user inserts & deletes char, ibuf gets trashed and
 	 * we don't want to use it)
 	 */
-	if (first_insert && ch != Ctrl('['))
+	if (first_insert && ch != CTRL('['))
 		saved_inslen = 0;
 	switch (ch) {
 	case '\0':
@@ -3877,10 +3976,10 @@ vi_insert(int ch)
 	case '\n':
 		return (1);
 
-	case Ctrl('['):
+	case CTRL('['):
 		expanded = NONE;
 		if (first_insert) {
-			first_insert = 0;
+			first_insert = false;
 			if (inslen == 0) {
 				inslen = saved_inslen;
 				return (redo_insert(0));
@@ -3895,19 +3994,19 @@ vi_insert(int ch)
 			return (redo_insert(lastac - 1));
 
 	/* { Begin nonstandard vi commands */
-	case Ctrl('x'):
+	case CTRL('x'):
 		expand_word(0);
 		break;
 
-	case Ctrl('f'):
+	case CTRL('f'):
 		complete_word(0, 0);
 		break;
 
-	case Ctrl('e'):
+	case CTRL('e'):
 		print_expansions(es, 0);
 		break;
 
-	case Ctrl('i'):
+	case CTRL('i'):
 		if (Flag(FVITABCOMPLETE)) {
 			complete_word(0, 0);
 			break;
@@ -3962,8 +4061,8 @@ vi_cmd(int argcnt, const char *cmd)
 		}
 		switch (*cmd) {
 
-		case Ctrl('l'):
-		case Ctrl('r'):
+		case CTRL('l'):
+		case CTRL('r'):
 			redraw_line(true);
 			break;
 
@@ -3992,12 +4091,12 @@ vi_cmd(int argcnt, const char *cmd)
 				 * at this point, it's fairly reasonable that
 				 * nlen + olen + 2 doesn't overflow
 				 */
-				nbuf = alloc(nlen + 1 + olen, APERM);
+				nbuf = alloc(nlen + 1 + olen, AEDIT);
 				memcpy(nbuf, ap->val.s, nlen);
 				nbuf[nlen++] = cmd[1];
 				if (macro.p) {
 					memcpy(nbuf + nlen, macro.p, olen);
-					afree(macro.buf, APERM);
+					afree(macro.buf, AEDIT);
 					nlen += olen;
 				} else {
 					nbuf[nlen++] = '\0';
@@ -4082,7 +4181,8 @@ vi_cmd(int argcnt, const char *cmd)
 			hnum = hlast;
 			if (es->linelen != 0)
 				es->cursor++;
-			while (putbuf(ybuf, yanklen, 0) == 0 && --argcnt > 0)
+			while (putbuf(ybuf, yanklen, false) == 0 &&
+			    --argcnt > 0)
 				;
 			if (es->cursor != 0)
 				es->cursor--;
@@ -4094,7 +4194,8 @@ vi_cmd(int argcnt, const char *cmd)
 			modified = 1;
 			hnum = hlast;
 			any = 0;
-			while (putbuf(ybuf, yanklen, 0) == 0 && --argcnt > 0)
+			while (putbuf(ybuf, yanklen, false) == 0 &&
+			    --argcnt > 0)
 				any = 1;
 			if (any && es->cursor != 0)
 				es->cursor--;
@@ -4148,7 +4249,7 @@ vi_cmd(int argcnt, const char *cmd)
 
 		case 'j':
 		case '+':
-		case Ctrl('n'):
+		case CTRL('n'):
 			if (grabhist(modified, hnum + argcnt) < 0)
 				return (-1);
 			else {
@@ -4159,7 +4260,7 @@ vi_cmd(int argcnt, const char *cmd)
 
 		case 'k':
 		case '-':
-		case Ctrl('p'):
+		case CTRL('p'):
 			if (grabhist(modified, hnum - argcnt) < 0)
 				return (-1);
 			else {
@@ -4296,10 +4397,15 @@ vi_cmd(int argcnt, const char *cmd)
 				hnum = c2;
 				ohnum = hnum;
 			}
+			if (argcnt >= 2) {
+				/* flag from cursor-up command */
+				es->cursor = argcnt - 2;
+				return (0);
+			}
 			break;
 		case '_':
 			{
-				int inspace;
+				bool inspace;
 				char *p, *sp;
 
 				if (histnum(-1) < 0)
@@ -4320,12 +4426,12 @@ vi_cmd(int argcnt, const char *cmd)
 					sp = p;
 				} else {
 					sp = p;
-					inspace = 0;
+					inspace = false;
 					while (*p) {
 						if (issp(*p))
-							inspace = 1;
+							inspace = true;
 						else if (inspace) {
-							inspace = 0;
+							inspace = false;
 							sp = p;
 						}
 						p++;
@@ -4340,11 +4446,8 @@ vi_cmd(int argcnt, const char *cmd)
 					argcnt++;
 					p++;
 				}
-				if (putbuf(" ", 1, 0) != 0)
-					argcnt = -1;
-				else if (putbuf(sp, argcnt, 0) != 0)
-					argcnt = -1;
-				if (argcnt < 0) {
+				if (putbuf(" ", 1, false) != 0 ||
+				    putbuf(sp, argcnt, false) != 0) {
 					if (es->cursor != 0)
 						es->cursor--;
 					return (-1);
@@ -4389,26 +4492,26 @@ vi_cmd(int argcnt, const char *cmd)
 		/* AT&T ksh */
 		case '=':
 		/* Nonstandard vi/ksh */
-		case Ctrl('e'):
+		case CTRL('e'):
 			print_expansions(es, 1);
 			break;
 
 
 		/* Nonstandard vi/ksh */
-		case Ctrl('i'):
+		case CTRL('i'):
 			if (!Flag(FVITABCOMPLETE))
 				return (-1);
 			complete_word(1, argcnt);
 			break;
 
 		/* some annoying AT&T kshs */
-		case Ctrl('['):
+		case CTRL('['):
 			if (!Flag(FVIESCCOMPLETE))
 				return (-1);
 		/* AT&T ksh */
 		case '\\':
 		/* Nonstandard vi/ksh */
-		case Ctrl('f'):
+		case CTRL('f'):
 			complete_word(1, argcnt);
 			break;
 
@@ -4416,9 +4519,19 @@ vi_cmd(int argcnt, const char *cmd)
 		/* AT&T ksh */
 		case '*':
 		/* Nonstandard vi/ksh */
-		case Ctrl('x'):
+		case CTRL('x'):
 			expand_word(1);
 			break;
+
+
+		/* mksh: cursor movement */
+		case '[':
+		case 'O':
+			state = VPREFIX2;
+			if (es->linelen != 0)
+				es->cursor++;
+			insert = INSERT;
+			return (0);
 		}
 		if (insert == 0 && es->cursor != 0 && es->cursor >= es->linelen)
 			es->cursor--;
@@ -4477,14 +4590,15 @@ domove(int argcnt, const char *cmd, int sub)
 		t = fsavecmd > 'a';
 		if (*cmd == ',')
 			t = !t;
-		if ((ncursor = findch(fsavech, argcnt, t, i)) < 0)
+		if ((ncursor = findch(fsavech, argcnt, tobool(t),
+		    tobool(i))) < 0)
 			return (-1);
 		if (sub && t)
 			ncursor++;
 		break;
 
 	case 'h':
-	case Ctrl('h'):
+	case CTRL('h'):
 		if (!sub && es->cursor == 0)
 			return (-1);
 		ncursor = es->cursor - argcnt;
@@ -4577,7 +4691,7 @@ static int
 redo_insert(int count)
 {
 	while (count-- > 0)
-		if (putbuf(ibuf, inslen, insert == REPLACE) != 0)
+		if (putbuf(ibuf, inslen, tobool(insert == REPLACE)) != 0)
 			return (-1);
 	if (es->cursor > 0)
 		es->cursor--;
@@ -4628,9 +4742,9 @@ bracktype(int ch)
 static void
 save_cbuf(void)
 {
-	memmove(holdbuf, es->cbuf, es->linelen);
+	memmove(holdbufp, es->cbuf, es->linelen);
 	holdlen = es->linelen;
-	holdbuf[holdlen] = '\0';
+	holdbufp[holdlen] = '\0';
 }
 
 static void
@@ -4638,7 +4752,7 @@ restore_cbuf(void)
 {
 	es->cursor = 0;
 	es->linelen = holdlen;
-	memmove(es->cbuf, holdbuf, holdlen);
+	memmove(es->cbuf, holdbufp, holdlen);
 }
 
 /* return a new edstate */
@@ -4647,8 +4761,8 @@ save_edstate(struct edstate *old)
 {
 	struct edstate *news;
 
-	news = alloc(sizeof(struct edstate), APERM);
-	news->cbuf = alloc(old->cbufsize, APERM);
+	news = alloc(sizeof(struct edstate), AEDIT);
+	news->cbuf = alloc(old->cbufsize, AEDIT);
 	memcpy(news->cbuf, old->cbuf, old->linelen);
 	news->cbufsize = old->cbufsize;
 	news->linelen = old->linelen;
@@ -4670,8 +4784,8 @@ restore_edstate(struct edstate *news, struct edstate *old)
 static void
 free_edstate(struct edstate *old)
 {
-	afree(old->cbuf, APERM);
-	afree(old, APERM);
+	afree(old->cbuf, AEDIT);
+	afree(old, AEDIT);
 }
 
 /*
@@ -4680,11 +4794,11 @@ free_edstate(struct edstate *old)
 static int
 x_vi_putbuf(const char *s, size_t len)
 {
-	return (putbuf(s, len, 0));
+	return (putbuf(s, len, false));
 }
 
 static int
-putbuf(const char *buf, ssize_t len, int repl)
+putbuf(const char *buf, ssize_t len, bool repl)
 {
 	if (len == 0)
 		return (0);
@@ -4714,7 +4828,7 @@ del_range(int a, int b)
 }
 
 static int
-findch(int ch, int cnt, int forw, int incl)
+findch(int ch, int cnt, bool forw, bool incl)
 {
 	int ncursor;
 
@@ -4896,11 +5010,11 @@ grabhist(int save, int n)
 }
 
 static int
-grabsearch(int save, int start, int fwd, char *pat)
+grabsearch(int save, int start, int fwd, const char *pat)
 {
 	char *hptr;
 	int hist;
-	int anchored;
+	bool anchored;
 
 	if ((start == 0 && fwd == 0) || (start >= hlast - 1 && fwd == 1))
 		return (-1);
@@ -4908,11 +5022,10 @@ grabsearch(int save, int start, int fwd, char *pat)
 		start++;
 	else
 		start--;
-	anchored = *pat == '^' ? (++pat, 1) : 0;
+	anchored = *pat == '^' ? (++pat, true) : false;
 	if ((hist = findhist(start, fwd, pat, anchored)) < 0) {
-		/* if (start != 0 && fwd && match(holdbuf, pat) >= 0) {} */
-		/* XXX should strcmp be strncmp? */
-		if (start != 0 && fwd && strcmp(holdbuf, pat) >= 0) {
+		/* (start != 0 && fwd && match(holdbufp, pat) >= 0) */
+		if (start != 0 && fwd && strcmp(holdbufp, pat) >= 0) {
 			restore_cbuf();
 			return (0);
 		} else
@@ -4938,9 +5051,9 @@ redraw_line(bool newl)
 		x_putc('\r');
 		x_putc('\n');
 	}
-	if (prompt_redraw)
+	if (prompt_trunc != -1)
 		pprompt(prompt, prompt_trunc);
-	cur_col = pwidth;
+	x_col = pwidth;
 	morec = ' ';
 }
 
@@ -4998,7 +5111,7 @@ rewindow(void)
 }
 
 static int
-newcol(int ch, int col)
+newcol(unsigned char ch, int col)
 {
 	if (ch == '\t')
 		return ((col | 7) + 1);
@@ -5026,10 +5139,10 @@ display(char *wb1, char *wb2, int leftside)
 				*twb1++ = ' ';
 			} while (++col < winwidth && (col & 7) != 0);
 		else if (col < winwidth) {
-			if (ch < ' ' || ch == 0x7f) {
+			if (ISCTRL(ch) && /* but not C1 */ ch < 0x80) {
 				*twb1++ = '^';
 				if (++col < winwidth) {
-					*twb1++ = ch ^ '@';
+					*twb1++ = UNCTRL(ch);
 					col++;
 				}
 			} else {
@@ -5058,10 +5171,10 @@ display(char *wb1, char *wb2, int leftside)
 	twb2 = wb2;
 	while (cnt--) {
 		if (*twb1 != *twb2) {
-			if (cur_col != col)
+			if (x_col != col)
 				ed_mov_opt(col, wb1);
 			x_putc(*twb1);
-			cur_col++;
+			x_col++;
 		}
 		twb1++;
 		twb2++;
@@ -5082,34 +5195,34 @@ display(char *wb1, char *wb2, int leftside)
 	if (mc != morec) {
 		ed_mov_opt(pwidth + winwidth + 1, wb1);
 		x_putc(mc);
-		cur_col++;
+		x_col++;
 		morec = mc;
 	}
-	if (cur_col != ncol)
+	if (x_col != ncol)
 		ed_mov_opt(ncol, wb1);
 }
 
 static void
 ed_mov_opt(int col, char *wb)
 {
-	if (col < cur_col) {
-		if (col + 1 < cur_col - col) {
+	if (col < x_col) {
+		if (col + 1 < x_col - col) {
 			x_putc('\r');
-			if (prompt_redraw)
+			if (prompt_trunc != -1)
 				pprompt(prompt, prompt_trunc);
-			cur_col = pwidth;
-			while (cur_col++ < col)
+			x_col = pwidth;
+			while (x_col++ < col)
 				x_putcf(*wb++);
 		} else {
-			while (cur_col-- > col)
+			while (x_col-- > col)
 				x_putc('\b');
 		}
 	} else {
-		wb = &wb[cur_col - pwidth];
-		while (cur_col++ < col)
+		wb = &wb[x_col - pwidth];
+		while (x_col++ < col)
 			x_putcf(*wb++);
 	}
-	cur_col = col;
+	x_col = col;
 }
 
 
@@ -5151,7 +5264,7 @@ expand_word(int cmd)
 			rval = -1;
 			break;
 		}
-		if (++i < nwords && putbuf(" ", 1, 0) != 0) {
+		if (++i < nwords && putbuf(" ", 1, false) != 0) {
 			rval = -1;
 			break;
 		}
@@ -5268,8 +5381,8 @@ complete_word(int cmd, int count)
 		 * and not a parameter or homedir substitution
 		 */
 		if (match_len > 0 && match[match_len - 1] != '/' &&
-		    !(flags & XCF_IS_SUBGLOB))
-			rval = putbuf(" ", 1, 0);
+		    !(flags & XCF_IS_NOSPACE))
+			rval = putbuf(" ", 1, false);
 	}
 	x_free_words(nwords, words);
 
@@ -5306,9 +5419,9 @@ print_expansions(struct edstate *est, int cmd MKSH_A_UNUSED)
 static void
 x_vi_zotc(int c)
 {
-	if (c < ' ' || c == 0x7f) {
+	if (ISCTRL(c)) {
 		x_putc('^');
-		c ^= '@';
+		c = UNCTRL(c);
 	}
 	x_putc(c);
 }
@@ -5326,39 +5439,58 @@ static void
 vi_macro_reset(void)
 {
 	if (macro.p) {
-		afree(macro.buf, APERM);
+		afree(macro.buf, AEDIT);
 		memset((char *)&macro, 0, sizeof(macro));
 	}
 }
 #endif /* !MKSH_S_NOVI */
 
+/* called from main.c */
 void
-x_mkraw(int fd, struct termios *ocb, bool forread)
+x_init(void)
 {
-	struct termios cb;
+	int i, j;
 
-	if (ocb)
-		tcgetattr(fd, ocb);
-	else
-		ocb = &tty_state;
+	/*
+	 * Set edchars to -2 to force initial binding, except
+	 * we need default values for some deficient systems…
+	 */
+	edchars.erase = edchars.kill = edchars.intr = edchars.quit =
+	    edchars.eof = -2;
+	/* ^W */
+	edchars.werase = 027;
 
-	cb = *ocb;
-	if (forread) {
-		cb.c_lflag &= ~(ICANON) | ECHO;
-	} else {
-		cb.c_iflag &= ~(INLCR | ICRNL);
-		cb.c_lflag &= ~(ISIG | ICANON | ECHO);
-	}
-#if defined(VLNEXT) && defined(_POSIX_VDISABLE)
-	/* OSF/1 processes lnext when ~icanon */
-	cb.c_cc[VLNEXT] = _POSIX_VDISABLE;
+	/* command line editing specific memory allocation */
+	ainit(AEDIT);
+	holdbufp = alloc(LINE, AEDIT);
+
+	/* initialise Emacs command line editing mode */
+	x_nextcmd = -1;
+
+	x_tab = alloc2(X_NTABS, sizeof(*x_tab), AEDIT);
+	for (j = 0; j < X_TABSZ; j++)
+		x_tab[0][j] = XFUNC_insert;
+	for (i = 1; i < X_NTABS; i++)
+		for (j = 0; j < X_TABSZ; j++)
+			x_tab[i][j] = XFUNC_error;
+	for (i = 0; i < (int)NELEM(x_defbindings); i++)
+		x_tab[x_defbindings[i].xdb_tab][x_defbindings[i].xdb_char]
+		    = x_defbindings[i].xdb_func;
+
+#ifndef MKSH_SMALL
+	x_atab = alloc2(X_NTABS, sizeof(*x_atab), AEDIT);
+	for (i = 1; i < X_NTABS; i++)
+		for (j = 0; j < X_TABSZ; j++)
+			x_atab[i][j] = NULL;
 #endif
-	/* SunOS 4.1.x & OSF/1 processes discard(flush) when ~icanon */
-#if defined(VDISCARD) && defined(_POSIX_VDISABLE)
-	cb.c_cc[VDISCARD] = _POSIX_VDISABLE;
-#endif
-	cb.c_cc[VTIME] = 0;
-	cb.c_cc[VMIN] = 1;
-
-	tcsetattr(fd, TCSADRAIN, &cb);
 }
+
+#ifdef DEBUG_LEAKS
+void
+x_done(void)
+{
+	if (x_tab != NULL)
+		afreeall(AEDIT);
+}
+#endif
+#endif /* !MKSH_NO_CMDLINE_EDITING */

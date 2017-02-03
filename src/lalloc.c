@@ -1,5 +1,5 @@
 /*-
- * Copyright (c) 2009, 2010, 2011
+ * Copyright (c) 2009, 2010, 2011, 2013, 2014
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -20,7 +20,7 @@
 
 #include "sh.h"
 
-__RCSID("$MirOS: src/bin/mksh/lalloc.c,v 1.19 2011/09/07 15:24:16 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/lalloc.c,v 1.20.2.1 2015/01/25 15:35:47 tg Exp $");
 
 /* build with CPPFLAGS+= -DUSE_REALLOC_MALLOC=0 on ancient systems */
 #if defined(USE_REALLOC_MALLOC) && (USE_REALLOC_MALLOC == 0)
@@ -29,7 +29,7 @@ __RCSID("$MirOS: src/bin/mksh/lalloc.c,v 1.19 2011/09/07 15:24:16 tg Exp $");
 #define remalloc(p,n)	realloc_osi((p), (n))
 #endif
 
-#define ALLOC_ISUNALIGNED(p) (((ptrdiff_t)(p)) % ALLOC_SIZE)
+#define ALLOC_ISUNALIGNED(p) (((size_t)(p)) % ALLOC_SIZE)
 
 static ALLOC_ITEM *findptr(ALLOC_ITEM **, char *, Area *);
 
@@ -100,7 +100,7 @@ aresize(void *ptr, size_t numb, Area *ap)
 	    || ALLOC_ISUNALIGNED(lp)
 #endif
 	    )
-		internal_errorf(Toomem, (unsigned long)numb);
+		internal_errorf(Toomem, numb);
 	/* this only works because Area is an ALLOC_ITEM */
 	lp->next = ap->next;
 	ap->next = lp;

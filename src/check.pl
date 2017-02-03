@@ -1,7 +1,8 @@
-# $MirOS: src/bin/mksh/check.pl,v 1.27 2011/05/29 02:18:47 tg Exp $
-# $OpenBSD: th,v 1.13 2006/05/18 21:27:23 miod Exp $
+# $MirOS: src/bin/mksh/check.pl,v 1.37.2.1 2015/04/12 22:32:16 tg Exp $
+# $OpenBSD: th,v 1.1 2013/12/02 20:39:44 millert Exp $
 #-
-# Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2011
+# Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2011,
+#		2012, 2013, 2014, 2015
 #	Thorsten Glaser <tg@mirbsd.org>
 #
 # Provided that these terms and disclaimer and all copyright notices
@@ -75,6 +76,7 @@
 #					    USER
 #					(values taken from the environment of
 #					the test harness).
+#					CYGWIN is set to nodosfilewarning.
 #					ENV is set to /nonexistant.
 #					__progname is set to the -p argument.
 #					__perlname is set to $^X (perlexe).
@@ -150,7 +152,24 @@
 #	p	tag takes parameters (used with m).
 #	s	tag can be used several times.
 
-use POSIX qw(EINTR);
+# pull EINTR from POSIX.pm or Errno.pm if they exist
+# otherwise just skip it
+BEGIN {
+	$EINTR = 0;
+	eval {
+		require POSIX;
+		$EINTR = POSIX::EINTR();
+	};
+	if ($@) {
+		eval {
+			require Errno;
+			$EINTR = Errno::EINTR();
+		} or do {
+			$EINTR = 0;
+		};
+	}
+};
+
 use Getopt::Std;
 use Config;
 
@@ -159,7 +178,8 @@ $os = defined $^O ? $^O : 'unknown';
 ($prog = $0) =~ s#.*/##;
 
 $Usage = <<EOF ;
-Usage: $prog [-Pv] [-C cat] [-e e=v] [-p prog] [-s fn] [-t tmo] name ...
+Usage: $prog [-Pv] [-C cat] [-e e=v] [-p prog] [-s fn] [-T dir] \
+       [-t tmo] name ...
 	-C c	Specify the comma separated list of categories the program
 		belongs to (see category field).
 	-e e=v	Set the environment variable e to v for all tests
@@ -170,6 +190,7 @@ Usage: $prog [-Pv] [-C cat] [-e e=v] [-p prog] [-s fn] [-t tmo] name ...
 	-p p	Use p as the program to test
 	-s s	Read tests from file s; if s is a directory, it is recursively
 		scaned for test files (which end in .t).
+	-T dir	Use dir instead of /tmp to hold temporary files
 	-t t	Use t as default time limit for tests (default is unlimited)
 	-v	Verbose mode: print reason test failed.
 	name	specifies the name of the test(s) to run; if none are
@@ -211,12 +232,6 @@ EOF
 	"os:$os", '1'
 	);
 
-$temps = "/tmp/rts$$";
-$tempi = "/tmp/rti$$";
-$tempo = "/tmp/rto$$";
-$tempe = "/tmp/rte$$";
-$tempdir = "/tmp/rtd$$";
-
 $nfailed = 0;
 $nifailed = 0;
 $nxfailed = 0;
@@ -225,7 +240,7 @@ $nxpassed = 0;
 
 %known_tests = ();
 
-if (!getopts('C:e:Pp:s:t:v')) {
+if (!getopts('C:e:Pp:s:T:t:v')) {
     print STDERR $Usage;
     exit 1;
 }
@@ -235,6 +250,7 @@ die "$prog: no test set specified (use -s)\n" if !defined $opt_s;
 $test_prog = $opt_p;
 $verbose = defined $opt_v && $opt_v;
 $test_set = $opt_s;
+$temp_base = $opt_T || "/tmp";
 if (defined $opt_t) {
     die "$prog: bad -t argument (should be number > 0): $opt_t\n"
 	if $opt_t !~ /^\d+$/ || $opt_t <= 0;
@@ -262,6 +278,7 @@ foreach $env (('HOME', 'LD_LIBRARY_PATH', 'LOCPATH', 'LOGNAME',
   'PATH', 'SHELL', 'UNIXMODE', 'USER')) {
     $new_env{$env} = $ENV{$env} if defined $ENV{$env};
 }
+$new_env{'CYGWIN'} = 'nodosfilewarning';
 $new_env{'ENV'} = '/nonexistant';
 if (($os eq 'VMS') || ($Config{perlpath} =~ m/$Config{_exe}$/i)) {
 	$new_env{'__perlname'} = $Config{perlpath};
@@ -278,10 +295,20 @@ if (defined $opt_e) {
 }
 %old_env = %ENV;
 
-die "$prog: couldn't make directory $tempdir - $!\n" if !mkdir($tempdir, 0777);
-
 chop($pwd = `pwd 2>/dev/null`);
 die "$prog: couldn't get current working directory\n" if $pwd eq '';
+die "$prog: couldn't cd to $pwd - $!\n" if !chdir($pwd);
+
+die "$prog: couldn't cd to $temp_base - $!\n" if !chdir($temp_base);
+die "$prog: couldn't get temporary directory base\n" unless -d '.';
+$temps = sprintf("chk%d-%d.", $$, time());
+$tempi = 0;
+until (mkdir(($tempdir = sprintf("%s%03d", $temps, $tempi)), 0700)) {
+    die "$prog: couldn't get temporary directory\n" if $tempi++ >= 999;
+}
+die "$prog: couldn't cd to $tempdir - $!\n" if !chdir($tempdir);
+chop($temp_dir = `pwd 2>/dev/null`);
+die "$prog: couldn't get temporary directory\n" if $temp_dir eq '';
 die "$prog: couldn't cd to $pwd - $!\n" if !chdir($pwd);
 
 if (!$program_kludge) {
@@ -296,6 +323,14 @@ $child_kill_ok = 0;
 $SIG{'ALRM'} = 'catch_sigalrm';
 
 $| = 1;
+
+# Create temp files
+$temps = "${temp_dir}/rts";
+$tempi = "${temp_dir}/rti";
+$tempo = "${temp_dir}/rto";
+$tempe = "${temp_dir}/rte";
+$tempdir = "${temp_dir}/rtd";
+mkdir($tempdir, 0700) or die "$prog: couldn't mkdir $tempdir - $!\n";
 
 if (-d $test_set) {
     $file_prefix_skip = length($test_set) + 1;
@@ -313,6 +348,7 @@ if ($tot_failed || $tot_passed) {
     print " ($nifailed ignored)" if $nifailed;
     print " ($nxfailed unexpected)" if $nxfailed;
     print " (as expected)" if $nfailed && !$nxfailed && !$nifailed;
+    print " ($nfailed expected)" if $nfailed && ($nxfailed || $nifailed);
     print "\nTotal passed: $tot_passed";
     print " ($nxpassed unexpected)" if $nxpassed;
     print "\n";
@@ -338,6 +374,7 @@ cleanup_exit
     unlink($tempi, $tempo, $tempe, $temps);
     &scrub_dir($tempdir) if defined $tempdir;
     rmdir($tempdir) if defined $tempdir;
+    rmdir($temp_dir) if defined $temp_dir;
 
     if ($sig) {
 	$SIG{$sig} = 'DEFAULT';
@@ -414,6 +451,8 @@ run_test
     local(*test) = @_;
     local($name) = $test{':full-name'};
 
+    return undef if !&scrub_dir($tempdir);
+
     if (defined $test{'stdin'}) {
 	return undef if !&write_file($tempi, $test{'stdin'});
 	$ifile = $tempi;
@@ -424,8 +463,6 @@ run_test
     if (defined $test{'script'}) {
 	return undef if !&write_file($temps, $test{'script'});
     }
-
-    return undef if !&scrub_dir($tempdir);
 
     if (!chdir($tempdir)) {
 	print STDERR "$prog: couldn't cd to $tempdir - $!\n";
@@ -531,7 +568,7 @@ run_test
 	}
 	push(@argv, $temps) if defined $test{'script'};
 
-	#XXX realpathise, use which/whence -p, or sth. like that
+	#XXX realpathise, use command -v/whence -p/which, or sth. like that
 	#XXX if !$program_kludge, we get by with not doing it for now tho
 	$new_env{'__progname'} = $argv[0];
 
@@ -555,7 +592,9 @@ run_test
 	$xpid = waitpid($pid, 0);
 	$child_kill_ok = 0;
 	if ($xpid < 0) {
-	    next if $! == EINTR;
+	    if ($EINTR) {
+		next if $! == $EINTR;
+	    }
 	    print STDERR "$prog: error waiting for child - $!\n";
 	    return undef;
 	}
@@ -874,7 +913,7 @@ eval_exit
     } else {
 	$expr = $expect;
 	$expr =~ s/\b([wse])\b/\$$1/g;
-	$expr =~ s/\b(SIG[A-Z0-9]+)\b/&$1/g;
+	$expr =~ s/\b(SIG[A-Z][A-Z0-9]*)\b/&$1/g;
     }
     $w = eval $expr;
     if ($@ ne '') {
@@ -894,12 +933,13 @@ read_test
     %test = ();
     %cnt = ();
     while (<$in>) {
+	chop;
 	next if /^\s*$/;
 	next if /^ *#/;
 	last if /^\s*---\s*$/;
 	$start_lineno = $. if !defined $start_lineno;
 	if (!/^([-\w]+):\s*(|\S|\S.*\S)\s*$/) {
-	    print STDERR "$prog:$file:$.: unrecognised line\n";
+	    print STDERR "$prog:$file:$.: unrecognised line \"$_\"\n";
 	    return undef;
 	}
 	($field, $val) = ($1, $2);
@@ -1125,7 +1165,7 @@ read_test
 		print STDERR "$prog:$test{':long-name'}: expected-exit value $val not in 0..255\n";
 		return undef;
 	    }
-	} elsif ($val !~ /^([\s<>+-=*%\/&|!()]|\b[wse]\b|\bSIG[A-Z0-9]+\b)+$/) {
+	} elsif ($val !~ /^([\s<>+-=*%\/&|!()]|\b[wse]\b|\bSIG[A-Z][A-Z0-9]*\b)+$/) {
 	    print STDERR "$prog:$test{':long-name'}: bad expected-exit expression: $val\n";
 	    return undef;
 	}

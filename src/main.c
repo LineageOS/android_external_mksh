@@ -1,10 +1,11 @@
-/*	$OpenBSD: main.c,v 1.47 2011/09/07 11:33:25 otto Exp $	*/
-/*	$OpenBSD: tty.c,v 1.9 2006/03/14 22:08:01 deraadt Exp $	*/
-/*	$OpenBSD: io.c,v 1.22 2006/03/17 16:30:13 millert Exp $	*/
-/*	$OpenBSD: table.c,v 1.13 2009/01/17 22:06:44 millert Exp $	*/
+/*	$OpenBSD: main.c,v 1.55 2015/02/09 09:09:30 jsg Exp $	*/
+/*	$OpenBSD: tty.c,v 1.10 2014/08/10 02:44:26 guenther Exp $	*/
+/*	$OpenBSD: io.c,v 1.25 2014/08/11 20:28:47 guenther Exp $	*/
+/*	$OpenBSD: table.c,v 1.15 2012/02/19 07:52:30 otto Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+ *		 2011, 2012, 2013, 2014, 2015
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -33,7 +34,7 @@
 #include <locale.h>
 #endif
 
-__RCSID("$MirOS: src/bin/mksh/main.c,v 1.200 2011/10/07 19:51:28 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/main.c,v 1.285.2.4 2015/04/19 19:18:20 tg Exp $");
 
 extern char **environ;
 
@@ -45,6 +46,8 @@ extern char **environ;
 #define MKSH_DEFAULT_TMPDIR	"/tmp"
 #endif
 
+static uint8_t isuc(const char *);
+static int main_init(int, const char *[], Source **, struct block **);
 void chvt_reinit(void);
 static void reclaim(void);
 static void remove_temps(struct temp *);
@@ -56,12 +59,12 @@ static void x_sigwinch(int);
 static const char initifs[] = "IFS= \t\n";
 
 static const char initsubs[] =
-    "${PS2=> } ${PS3=#? } ${PS4=+ } ${SECONDS=0} ${TMOUT=0}";
+    "${PS2=> } ${PS3=#? } ${PS4=+ } ${SECONDS=0} ${TMOUT=0} ${EPOCHREALTIME=}";
 
 static const char *initcoms[] = {
 	Ttypeset, "-r", initvsn, NULL,
-	Ttypeset, "-x", "HOME", "PATH", "RANDOM", "SHELL", NULL,
-	Ttypeset, "-i10", "SECONDS", "TMOUT", NULL,
+	Ttypeset, "-x", "HOME", "PATH", "SHELL", NULL,
+	Ttypeset, "-i10", "COLUMNS", "LINES", "SECONDS", "TMOUT", NULL,
 	Talias,
 	"integer=typeset -i",
 	Tlocal_typeset,
@@ -72,7 +75,6 @@ static const char *initcoms[] = {
 	/* not in Android for political reasons */
 	/* not in ARGE mksh due to no job control */
 	"stop=kill -STOP",
-	"suspend=kill -STOP $$",
 #endif
 	"autoload=typeset -fu",
 	"functions=typeset -f",
@@ -94,7 +96,7 @@ static const char *restr_com[] = {
 	Ttypeset, "-r", "PATH", "ENV", "SHELL", NULL
 };
 
-static int initio_done;
+static bool initio_done;
 
 /* top-level parsing and execution environment */
 static struct env env;
@@ -107,9 +109,10 @@ rndsetup(void)
 	struct {
 		ALLOC_ITEM alloc_INT;
 		void *dataptr, *stkptr, *mallocptr;
+#if defined(__GLIBC__) && (__GLIBC__ >= 2)
 		sigjmp_buf jbuf;
+#endif
 		struct timeval tv;
-		struct timezone tz;
 	} *bufptr;
 	char *cp;
 
@@ -126,17 +129,14 @@ rndsetup(void)
 	bufptr->stkptr = &bufptr;
 	/* randomised malloc in BSD (and possibly others) */
 	bufptr->mallocptr = bufptr;
+#if defined(__GLIBC__) && (__GLIBC__ >= 2)
 	/* glibc pointer guard */
 	sigsetjmp(bufptr->jbuf, 1);
-	/* introduce variation */
-	gettimeofday(&bufptr->tv, &bufptr->tz);
+#endif
+	/* introduce variation (and yes, second arg MBZ for portability) */
+	mksh_TIME(bufptr->tv);
 
-	NZATInit(h);
-	/* variation through pid, ppid, and the works */
-	NZATUpdateMem(h, &rndsetupstate, sizeof(rndsetupstate));
-	/* some variation, some possibly entropy, depending on OE */
-	NZATUpdateMem(h, bufptr, sizeof(*bufptr));
-	NZAATFinish(h);
+	h = chvt_rndsetup(bufptr, sizeof(*bufptr));
 
 	afree(cp, APERM);
 	return ((mksh_uari_t)h);
@@ -155,13 +155,36 @@ static const char *empty_argv[] = {
 	"mksh", NULL
 };
 
-int
-main(int argc, const char *argv[])
+static uint8_t
+isuc(const char *cx) {
+	char *cp, *x;
+	uint8_t rv = 0;
+
+	if (!cx || !*cx)
+		return (0);
+
+	/* uppercase a string duplicate */
+	strdupx(x, cx, ATEMP);
+	cp = x;
+	while ((*cp = ksh_toupper(*cp)))
+		++cp;
+
+	/* check for UTF-8 */
+	if (strstr(x, "UTF-8") || strstr(x, "UTF8"))
+		rv = 1;
+
+	/* free copy and out */
+	afree(x, ATEMP);
+	return (rv);
+}
+
+static int
+main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 {
 	int argi, i;
 	Source *s = NULL;
 	struct block *l;
-	unsigned char restricted, errexit, utf_flag;
+	unsigned char restricted_shell, errexit, utf_flag;
 	char *cp;
 	const char *ccp, **wp;
 	struct tbl *vp;
@@ -207,10 +230,27 @@ main(int argc, const char *argv[])
 	if (!*ccp)
 		ccp = empty_argv[0];
 
+	/*
+	 * Turn on nohup by default. (AT&T ksh does not have a nohup
+	 * option - it always sends the hup).
+	 */
+	Flag(FNOHUP) = 1;
+
+	/*
+	 * Turn on brace expansion by default. AT&T kshs that have
+	 * alternation always have it on.
+	 */
+	Flag(FBRACEEXPAND) = 1;
+
+	/*
+	 * Turn on "set -x" inheritance by default.
+	 */
+	Flag(FXTRACEREC) = 1;
+
 	/* define built-in commands and see if we were called as one */
 	ktinit(APERM, &builtins,
-	    /* currently 50 builtins -> 80% of 64 (2^6) */
-	    6);
+	    /* currently up to 51 builtins: 75% of 128 = 2^7 */
+	    7);
 	for (i = 0; mkshbuiltins[i].name != NULL; i++)
 		if (!strcmp(ccp, builtin(mkshbuiltins[i].name,
 		    mkshbuiltins[i].func)))
@@ -222,10 +262,19 @@ main(int argc, const char *argv[])
 		if (argi < 0)
 			return (1);
 
+#if defined(MKSH_BINSHPOSIX) || defined(MKSH_BINSHREDUCED)
+		/* are we called as -sh or /bin/sh or so? */
+		if (!strcmp(ccp, "sh")) {
+			/* either also turns off braceexpand */
+#ifdef MKSH_BINSHPOSIX
+			/* enable better POSIX conformance */
+			change_flag(FPOSIX, OF_FIRSTTIME, true);
+#endif
 #ifdef MKSH_BINSHREDUCED
-		/* set FSH if we're called as -sh or /bin/sh or so */
-		if (!strcmp(ccp, "sh"))
-			change_flag(FSH, OF_FIRSTTIME, 1);
+			/* enable kludge/compat mode */
+			change_flag(FSH, OF_FIRSTTIME, true);
+#endif
+		}
 #endif
 	}
 
@@ -248,6 +297,9 @@ main(int argc, const char *argv[])
 	initkeywords();
 
 	init_histvec();
+
+	/* initialise tty size before importing environment */
+	change_winsz();
 
 #ifdef _PATH_DEFPATH
 	def_path = _PATH_DEFPATH;
@@ -277,34 +329,27 @@ main(int argc, const char *argv[])
 	/* setstr can't fail here */
 	setstr(vp, def_path, KSH_RETURN_ERROR);
 
-	/*
-	 * Turn on nohup by default for now - will change to off
-	 * by default once people are aware of its existence
-	 * (AT&T ksh does not have a nohup option - it always sends
-	 * the hup).
-	 */
-	Flag(FNOHUP) = 1;
-
-	/*
-	 * Turn on brace expansion by default. AT&T kshs that have
-	 * alternation always have it on.
-	 */
-	Flag(FBRACEEXPAND) = 1;
-
+#ifndef MKSH_NO_CMDLINE_EDITING
 	/*
 	 * Set edit mode to emacs by default, may be overridden
 	 * by the environment or the user. Also, we want tab completion
 	 * on in vi by default.
 	 */
-	change_flag(FEMACS, OF_SPECIAL, 1);
+	change_flag(FEMACS, OF_SPECIAL, true);
 #if !MKSH_S_NOVI
 	Flag(FVITABCOMPLETE) = 1;
 #endif
+#endif
 
 	/* import environment */
-	if (environ != NULL)
-		for (wp = (const char **)environ; *wp != NULL; wp++)
+	if (environ != NULL) {
+		wp = (const char **)environ;
+		while (*wp != NULL) {
+			rndpush(*wp);
 			typeset(*wp, IMPORT | EXPORT, 0, 0, 0);
+			++wp;
+		}
+	}
 
 	/* for security */
 	typeset(initifs, 0, 0, 0, 0);
@@ -330,9 +375,7 @@ main(int argc, const char *argv[])
 		while (*wp != NULL)
 			wp++;
 	}
-	setint_n(global("COLUMNS"), 0);
-	setint_n(global("LINES"), 0);
-	setint_n(global("OPTIND"), 1);
+	setint_n(global("OPTIND"), 1, 10);
 
 	kshuid = getuid();
 	kshgid = getgid();
@@ -345,24 +388,30 @@ main(int argc, const char *argv[])
 	    (!ksheuid && !strchr(str_val(vp), '#')))
 		/* setstr can't fail here */
 		setstr(vp, safe_prompt, KSH_RETURN_ERROR);
-	setint_n((vp = global("PGRP")), (mksh_uari_t)kshpgrp);
+	setint_n((vp = global("BASHPID")), 0, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("PPID")), (mksh_uari_t)kshppid);
+	setint_n((vp = global("PGRP")), (mksh_uari_t)kshpgrp, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("USER_ID")), (mksh_uari_t)ksheuid);
+	setint_n((vp = global("PPID")), (mksh_uari_t)kshppid, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("KSHUID")), (mksh_uari_t)kshuid);
+	setint_n((vp = global("USER_ID")), (mksh_uari_t)ksheuid, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("KSHEGID")), (mksh_uari_t)kshegid);
+	setint_n((vp = global("KSHUID")), (mksh_uari_t)kshuid, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("KSHGID")), (mksh_uari_t)kshgid);
+	setint_n((vp = global("KSHEGID")), (mksh_uari_t)kshegid, 10);
 	vp->flag |= INT_U;
-	setint_n((vp = global("RANDOM")), rndsetup());
+	setint_n((vp = global("KSHGID")), (mksh_uari_t)kshgid, 10);
 	vp->flag |= INT_U;
-	setint_n((vp_pipest = global("PIPESTATUS")), 0);
+	setint_n((vp = global("RANDOM")), rndsetup(), 10);
+	vp->flag |= INT_U;
+	setint_n((vp_pipest = global("PIPESTATUS")), 0, 10);
 
 	/* Set this before parsing arguments */
-	Flag(FPRIVILEGED) = kshuid != ksheuid || kshgid != kshegid;
+	Flag(FPRIVILEGED) = (
+#if HAVE_ISSETUGID
+	    issetugid() ||
+#endif
+	    kshuid != ksheuid || kshgid != kshegid) ? 2 : 0;
 
 	/* this to note if monitor is set on command line (see below) */
 #ifndef MKSH_UNEMPLOYED
@@ -377,44 +426,6 @@ main(int argc, const char *argv[])
 			return (1);
 	}
 
-#ifdef DEBUG
-	/* test wraparound of arithmetic types */
-	{
-		volatile long xl;
-		volatile unsigned long xul;
-		volatile int xi;
-		volatile unsigned int xui;
-		volatile mksh_ari_t xa;
-		volatile mksh_uari_t xua, xua2;
-		volatile uint8_t xc;
-
-		xa = 2147483647;
-		xua = 2147483647;
-		++xa;
-		++xua;
-		xua2 = xa;
-		xl = xa;
-		xul = xua;
-		xa = 0;
-		xua = 0;
-		--xa;
-		--xua;
-		xi = xa;
-		xui = xua;
-		xa = -1;
-		xua = xa;
-		++xa;
-		++xua;
-		xc = 0;
-		--xc;
-		if ((xua2 != 2147483648UL) ||
-		    (xl != -2147483648L) || (xul != 2147483648UL) ||
-		    (xi != -1) || (xui != 4294967295U) ||
-		    (xa != 0) || (xua != 0) || (xc != 255))
-			errorf("integer wraparound test failed");
-	}
-#endif
-
 	/* process this later only, default to off (hysterical raisins) */
 	utf_flag = UTFMODE;
 	UTFMODE = 0;
@@ -423,9 +434,17 @@ main(int argc, const char *argv[])
 		/* auto-detect from environment variables, always */
 		utf_flag = 3;
 	} else if (Flag(FCOMMAND)) {
-		s = pushs(SSTRING, ATEMP);
+		s = pushs(SSTRINGCMDLINE, ATEMP);
 		if (!(s->start = s->str = argv[argi++]))
 			errorf("%s %s", "-c", "requires an argument");
+		while (*s->str) {
+			if (*s->str != ' ' && ctype(*s->str, C_QUOTE))
+				break;
+			s->str++;
+		}
+		if (!*s->str)
+			s->flags |= SF_MAYEXEC;
+		s->str = s->start;
 #ifdef MKSH_MIDNIGHTBSD01ASH_COMPAT
 		/* compatibility to MidnightBSD 0.1 /bin/sh (kludge) */
 		if (Flag(FSH) && argv[argi] && !strcmp(argv[argi], "--"))
@@ -440,7 +459,7 @@ main(int argc, const char *argv[])
 		    SHF_MAPHI | SHF_CLEXEC);
 		if (s->u.shf == NULL) {
 			shl_stdout_ok = false;
-			warningf(true, "%s: %s", s->file, strerror(errno));
+			warningf(true, "%s: %s", s->file, cstrerror(errno));
 			/* mandated by SUSv4 */
 			exstat = 127;
 			unwind(LERROR);
@@ -468,20 +487,24 @@ main(int argc, const char *argv[])
 
 	/* initialise job control */
 	j_init();
-	/* Do this after j_init(), as tty_fd is not initialised until then */
+	/* do this after j_init() which calls tty_init_state() */
 	if (Flag(FTALKING)) {
 		if (utf_flag == 2) {
 #ifndef MKSH_ASSUME_UTF8
 			/* auto-detect from locale or environment */
 			utf_flag = 4;
-#elif MKSH_ASSUME_UTF8
+#else /* this may not be an #elif */
+#if MKSH_ASSUME_UTF8
 			utf_flag = 1;
 #else
 			/* always disable UTF-8 (for interactive) */
 			utf_flag = 0;
 #endif
+#endif
 		}
+#ifndef MKSH_NO_CMDLINE_EDITING
 		x_init();
+#endif
 	}
 
 #ifdef SIGWINCH
@@ -497,14 +520,20 @@ main(int argc, const char *argv[])
 		l->argv[0] = ccp;
 	} else {
 		l->argc = argc - argi;
-		l->argv = &argv[argi - 1];
+		/*
+		 * allocate a new array because otherwise, when we modify
+		 * it in-place, ps(1) output changes; the meaning of argc
+		 * here is slightly different as it excludes kshname, and
+		 * we add a trailing NULL sentinel as well
+		 */
+		l->argv = alloc2(l->argc + 2, sizeof(void *), APERM);
 		l->argv[0] = kshname;
+		memcpy(&l->argv[1], &argv[argi], l->argc * sizeof(void *));
+		l->argv[l->argc + 1] = NULL;
 		getopts_reset(1);
 	}
 
 	/* divine the initial state of the utf8-mode Flag */
-#define isuc(x)	(((x) != NULL) && \
-	    (stristr((x), "UTF-8") || stristr((x), "utf8")))
 	ccp = null;
 	switch (utf_flag) {
 
@@ -546,10 +575,9 @@ main(int argc, const char *argv[])
 		UTFMODE = utf_flag;
 		break;
 	}
-#undef isuc
 
 	/* Disable during .profile/ENV reading */
-	restricted = Flag(FRESTRICTED);
+	restricted_shell = Flag(FRESTRICTED);
 	Flag(FRESTRICTED) = 0;
 	errexit = Flag(FERREXIT);
 	Flag(FERREXIT) = 0;
@@ -561,32 +589,32 @@ main(int argc, const char *argv[])
 	if (!current_wd[0] && Flag(FTALKING))
 		warningf(false, "can't determine current directory");
 
-	if (Flag(FLOGIN)) {
-		include(MKSH_SYSTEM_PROFILE, 0, NULL, 1);
-		if (!Flag(FPRIVILEGED))
-			include(substitute("$HOME/.profile", 0), 0,
-			    NULL, 1);
+	if (Flag(FLOGIN))
+		include(MKSH_SYSTEM_PROFILE, 0, NULL, true);
+	if (!Flag(FPRIVILEGED)) {
+		if (Flag(FLOGIN))
+			include(substitute("$HOME/.profile", 0), 0, NULL, true);
+		if (Flag(FTALKING)) {
+			cp = substitute(substitute("${ENV:-" MKSHRC_PATH "}",
+			    0), DOTILDE);
+			if (cp[0] != '\0')
+				include(cp, 0, NULL, true);
+		}
+	} else {
+		include(MKSH_SUID_PROFILE, 0, NULL, true);
+		/* turn off -p if not set explicitly */
+		if (Flag(FPRIVILEGED) != 1)
+			change_flag(FPRIVILEGED, OF_INTERNAL, false);
 	}
-	if (Flag(FPRIVILEGED))
-		include(MKSH_SUID_PROFILE, 0, NULL, 1);
-	else if (Flag(FTALKING)) {
-		char *env_file;
 
-		/* include $ENV */
-		env_file = substitute(substitute("${ENV:-" MKSHRC_PATH "}", 0),
-		    DOTILDE);
-		if (*env_file != '\0')
-			include(env_file, 0, NULL, 1);
-	}
-
-	if (restricted) {
+	if (restricted_shell) {
 		shcomexec(restr_com);
 		/* After typeset command... */
 		Flag(FRESTRICTED) = 1;
 	}
 	Flag(FERREXIT) = errexit;
 
-	if (Flag(FTALKING))
+	if (Flag(FTALKING) && s)
 		hist_init(s);
 	else
 		/* set after ENV */
@@ -594,17 +622,33 @@ main(int argc, const char *argv[])
 
 	alarm_init();
 
-	if (Flag(FAS_BUILTIN))
-		return (shcomexec(l->argv));
-
-	/* doesn't return */
-	shell(s, true);
-	/* NOTREACHED */
+	*sp = s;
+	*lp = l;
 	return (0);
 }
 
+/* this indirection barrier reduces stack usage during normal operation */
+
 int
-include(const char *name, int argc, const char **argv, int intr_ok)
+main(int argc, const char *argv[])
+{
+	int rv;
+	Source *s;
+	struct block *l;
+
+	if ((rv = main_init(argc, argv, &s, &l)) == 0) {
+		if (Flag(FAS_BUILTIN)) {
+			rv = shcomexec(l->argv);
+		} else {
+			shell(s, true);
+			/* NOTREACHED */
+		}
+	}
+	return (rv);
+}
+
+int
+include(const char *name, int argc, const char **argv, bool intr_ok)
 {
 	Source *volatile s = NULL;
 	struct shf *shf;
@@ -624,8 +668,7 @@ include(const char *name, int argc, const char **argv, int intr_ok)
 		old_argc = 0;
 	}
 	newenv(E_INCL);
-	i = sigsetjmp(e->jbuf, 0);
-	if (i) {
+	if ((i = kshsetjmp(e->jbuf))) {
 		quitenv(s ? s->u.shf : NULL);
 		if (old_argv) {
 			e->loc->argv = old_argv;
@@ -641,7 +684,7 @@ include(const char *name, int argc, const char **argv, int intr_ok)
 			 * intr_ok is set if we are including .profile or $ENV.
 			 * If user ^Cs out, we don't want to kill the shell...
 			 */
-			if (intr_ok && (exstat - 128) != SIGTERM)
+			if (intr_ok && ((exstat & 0xFF) - 128) != SIGTERM)
 				return (1);
 			/* FALLTHROUGH */
 		case LEXIT:
@@ -687,62 +730,63 @@ command(const char *comm, int line)
  * run the commands from the input source, returning status.
  */
 int
-shell(Source * volatile s, volatile int toplevel)
+shell(Source * volatile s, volatile bool toplevel)
 {
 	struct op *t;
-	volatile int wastty = s->flags & SF_TTY;
-	volatile int attempts = 13;
-	volatile int interactive = Flag(FTALKING) && toplevel;
+	volatile bool wastty = tobool(s->flags & SF_TTY);
+	volatile uint8_t attempts = 13;
+	volatile bool interactive = Flag(FTALKING) && toplevel;
 	volatile bool sfirst = true;
 	Source *volatile old_source = source;
 	int i;
 
 	newenv(E_PARSE);
 	if (interactive)
-		really_exit = 0;
-	i = sigsetjmp(e->jbuf, 0);
-	if (i) {
-		switch (i) {
-		case LINTR:
-			/* we get here if SIGINT not caught or ignored */
-		case LERROR:
-		case LSHELL:
-			if (interactive) {
-				if (i == LINTR)
-					shellf("\n");
-				/*
-				 * Reset any eof that was read as part of a
-				 * multiline command.
-				 */
-				if (Flag(FIGNOREEOF) && s->type == SEOF &&
-				    wastty)
-					s->type = SSTDIN;
-				/*
-				 * Used by exit command to get back to
-				 * top level shell. Kind of strange since
-				 * interactive is set if we are reading from
-				 * a tty, but to have stopped jobs, one only
-				 * needs FMONITOR set (not FTALKING/SF_TTY)...
-				 */
-				/* toss any input we have so far */
-				s->start = s->str = null;
-				break;
-			}
-			/* FALLTHROUGH */
-		case LEXIT:
-		case LLEAVE:
-		case LRETURN:
-			source = old_source;
-			quitenv(NULL);
-			/* keep on going */
-			unwind(i);
-			/* NOTREACHED */
-		default:
-			source = old_source;
-			quitenv(NULL);
-			internal_errorf("%s %d", "shell", i);
-			/* NOTREACHED */
+		really_exit = false;
+	switch ((i = kshsetjmp(e->jbuf))) {
+	case 0:
+		break;
+	case LINTR:
+		/* we get here if SIGINT not caught or ignored */
+	case LERROR:
+	case LSHELL:
+		if (interactive) {
+			if (i == LINTR)
+				shellf("\n");
+			/*
+			 * Reset any eof that was read as part of a
+			 * multiline command.
+			 */
+			if (Flag(FIGNOREEOF) && s->type == SEOF && wastty)
+				s->type = SSTDIN;
+			/*
+			 * Used by exit command to get back to
+			 * top level shell. Kind of strange since
+			 * interactive is set if we are reading from
+			 * a tty, but to have stopped jobs, one only
+			 * needs FMONITOR set (not FTALKING/SF_TTY)...
+			 */
+			/* toss any input we have so far */
+			yyrecursive_pop(true);
+			s->start = s->str = null;
+			retrace_info = NULL;
+			herep = heres;
+			break;
 		}
+		/* FALLTHROUGH */
+	case LEXIT:
+	case LLEAVE:
+	case LRETURN:
+		source = old_source;
+		quitenv(NULL);
+		/* keep on going */
+		unwind(i);
+		/* NOTREACHED */
+	default:
+		source = old_source;
+		quitenv(NULL);
+		internal_errorf("%s %d", "shell", i);
+		/* NOTREACHED */
 	}
 	while (/* CONSTCOND */ 1) {
 		if (trap)
@@ -760,13 +804,15 @@ shell(Source * volatile s, volatile int toplevel)
 		}
 		t = compile(s, sfirst);
 		sfirst = false;
-		if (t != NULL && t->type == TEOF) {
+		if (!t)
+			goto source_no_tree;
+		if (t->type == TEOF) {
 			if (wastty && Flag(FIGNOREEOF) && --attempts > 0) {
 				shellf("Use 'exit' to leave mksh\n");
 				s->type = SSTDIN;
 			} else if (wastty && !really_exit &&
 			    j_stopped_running()) {
-				really_exit = 1;
+				really_exit = true;
 				s->type = SSTDIN;
 			} else {
 				/*
@@ -779,37 +825,58 @@ shell(Source * volatile s, volatile int toplevel)
 					unwind(LEXIT);
 				break;
 			}
-		}
-		if (t && (!Flag(FNOEXEC) || (s->flags & SF_TTY)))
-			exstat = execute(t, 0, NULL);
+		} else if ((s->flags & SF_MAYEXEC) && t->type == TCOM)
+			t->u.evalflags |= DOTCOMEXEC;
+		if (!Flag(FNOEXEC) || (s->flags & SF_TTY))
+			exstat = execute(t, 0, NULL) & 0xFF;
 
-		if (t != NULL && t->type != TEOF && interactive && really_exit)
-			really_exit = 0;
+		if (t->type != TEOF && interactive && really_exit)
+			really_exit = false;
 
+ source_no_tree:
 		reclaim();
 	}
 	quitenv(NULL);
 	source = old_source;
-	return (exstat);
+	return (exstat & 0xFF);
 }
 
 /* return to closest error handler or shell(), exit if none found */
+/* note: i MUST NOT be 0 */
 void
 unwind(int i)
 {
+	/*
+	 * This is a kludge. We need to restore everything that was
+	 * changed in the new environment, see cid 1005090337C7A669439
+	 * and 10050903386452ACBF1, but fail to even save things most of
+	 * the time. funcs.c:c_eval() changes FERREXIT temporarily to 0,
+	 * which needs to be restored thus (related to Debian #696823).
+	 * We did not save the shell flags, so we use a special or'd
+	 * value here... this is mostly to clean up behind *other*
+	 * callers of unwind(LERROR) here; exec.c has the regular case.
+	 */
+	if (Flag(FERREXIT) & 0x80) {
+		/* GNU bash does not run this trapsig */
+		trapsig(ksh_SIGERR);
+		Flag(FERREXIT) &= ~0x80;
+	}
+
 	/* ordering for EXIT vs ERR is a bit odd (this is what AT&T ksh does) */
-	if (i == LEXIT || (Flag(FERREXIT) && (i == LERROR || i == LINTR) &&
-	    sigtraps[ksh_SIGEXIT].trap)) {
+	if (i == LEXIT || ((i == LERROR || i == LINTR) &&
+	    sigtraps[ksh_SIGEXIT].trap &&
+	    (!Flag(FTALKING) || Flag(FERREXIT)))) {
 		++trap_nested;
 		runtrap(&sigtraps[ksh_SIGEXIT], trap_nested == 1);
 		--trap_nested;
 		i = LLEAVE;
-	} else if (Flag(FERREXIT) && (i == LERROR || i == LINTR)) {
+	} else if (Flag(FERREXIT) == 1 && (i == LERROR || i == LINTR)) {
 		++trap_nested;
 		runtrap(&sigtraps[ksh_SIGERR], trap_nested == 1);
 		--trap_nested;
 		i = LLEAVE;
 	}
+
 	while (/* CONSTCOND */ 1) {
 		switch (e->type) {
 		case E_PARSE:
@@ -817,7 +884,7 @@ unwind(int i)
 		case E_INCL:
 		case E_LOOP:
 		case E_ERRH:
-			siglongjmp(e->jbuf, i);
+			kshlongjmp(e->jbuf, i);
 			/* NOTREACHED */
 		case E_NONE:
 			if (i == LINTR)
@@ -825,6 +892,13 @@ unwind(int i)
 			/* FALLTHROUGH */
 		default:
 			quitenv(NULL);
+			/*
+			 * quitenv() may have reclaimed the memory
+			 * used by source which will end badly when
+			 * we jump to a function that expects it to
+			 * be valid
+			 */
+			source = NULL;
 		}
 	}
 }
@@ -848,6 +922,7 @@ newenv(int type)
 	ep->loc = e->loc;
 	ep->savefd = NULL;
 	ep->temps = NULL;
+	ep->yyrecursive_statep = NULL;
 	ep->type = type;
 	ep->flags = 0;
 	/* jump buffer is invalid because flags == 0 */
@@ -861,7 +936,8 @@ quitenv(struct shf *shf)
 	char *cp;
 	int fd;
 
-	if (ep->oenv && ep->oenv->loc != ep->loc)
+	yyrecursive_pop(true);
+	while (ep->oenv && ep->oenv->loc != ep->loc)
 		popblock();
 	if (ep->savefd != NULL) {
 		for (fd = 0; fd < NUFILE; fd++)
@@ -877,6 +953,10 @@ quitenv(struct shf *shf)
 	 * Either main shell is exiting or cleanup_parents_env() was called.
 	 */
 	if (ep->oenv == NULL) {
+#ifdef DEBUG_LEAKS
+		int i;
+#endif
+
 		if (ep->type == E_NONE) {
 			/* Main shell exiting? */
 #if HAVE_PERSISTENT_HISTORY
@@ -885,7 +965,7 @@ quitenv(struct shf *shf)
 #endif
 			j_exit();
 			if (ep->flags & EF_FAKE_SIGDIE) {
-				int sig = exstat - 128;
+				int sig = (exstat & 0xFF) - 128;
 
 				/*
 				 * ham up our death a bit (AT&T ksh
@@ -904,7 +984,24 @@ quitenv(struct shf *shf)
 		if (shf)
 			shf_close(shf);
 		reclaim();
-		exit(exstat);
+#ifdef DEBUG_LEAKS
+#ifndef MKSH_NO_CMDLINE_EDITING
+		x_done();
+#endif
+#ifndef MKSH_NOPROSPECTOFWORK
+		/* block at least SIGCHLD during/after afreeall */
+		sigprocmask(SIG_BLOCK, &sm_sigchld, NULL);
+#endif
+		afreeall(APERM);
+		for (fd = 3; fd < NUFILE; fd++)
+			if ((i = fcntl(fd, F_GETFD, 0)) != -1 &&
+			    (i & FD_CLOEXEC))
+				close(fd);
+		close(2);
+		close(1);
+		close(0);
+#endif
+		exit(exstat & 0xFF);
 	}
 	if (shf)
 		shf_close(shf);
@@ -924,8 +1021,6 @@ cleanup_parents_env(void)
 	struct env *ep;
 	int fd;
 
-	mkssert(e != NULL);
-
 	/*
 	 * Don't clean up temporary files - parent will probably need them.
 	 * Also, can't easily reclaim memory since variables, etc. could be
@@ -941,8 +1036,14 @@ cleanup_parents_env(void)
 			afree(ep->savefd, &ep->area);
 			ep->savefd = NULL;
 		}
+#ifdef DEBUG_LEAKS
+		if (ep->type != E_NONE)
+			ep->type = E_GONE;
+#endif
 	}
+#ifndef DEBUG_LEAKS
 	e->oenv = NULL;
+#endif
 }
 
 /* Called just before an execve cleanup stuff temporary files */
@@ -959,6 +1060,13 @@ cleanup_proc_env(void)
 static void
 reclaim(void)
 {
+	struct block *l;
+
+	while ((l = e->loc) && (!e->oenv || e->oenv->loc != l)) {
+		e->loc = l->next;
+		afreeall(&l->area);
+	}
+
 	remove_temps(e->temps);
 	e->temps = NULL;
 	afreeall(&e->area);
@@ -969,75 +1077,80 @@ remove_temps(struct temp *tp)
 {
 	for (; tp != NULL; tp = tp->next)
 		if (tp->pid == procpid)
-			unlink(tp->name);
+			unlink(tp->tffn);
 }
 
 /*
- * Initialise tty_fd. Used for saving/reseting tty modes upon
- * foreground job completion and for setting up tty process group.
+ * Initialise tty_fd. Used for tracking the size of the terminal,
+ * saving/resetting tty modes upon forground job completion, and
+ * for setting up the tty process group. Return values:
+ *	0 = got controlling tty
+ *	1 = got terminal but no controlling tty
+ *	2 = cannot find a terminal
+ *	3 = cannot dup fd
+ *	4 = cannot make fd close-on-exec
+ * An existing tty_fd is cached if no "better" one could be found,
+ * i.e. if tty_devtty was already set or the new would not set it.
  */
-void
-tty_init(bool init_ttystate, bool need_tty)
+int
+tty_init_fd(void)
 {
-	bool do_close = true;
-	int tfd;
+	int fd, rv, eno = 0;
+	bool do_close = false, is_devtty = true;
 
-	if (tty_fd >= 0) {
-		close(tty_fd);
-		tty_fd = -1;
+	if (tty_devtty) {
+		/* already got a tty which is /dev/tty */
+		return (0);
 	}
-	tty_devtty = true;
 
 #ifdef _UWIN
 	/*XXX imake style */
 	if (isatty(3)) {
 		/* fd 3 on UWIN _is_ /dev/tty (or our controlling tty) */
-		tfd = 3;
-		do_close = false;
-	} else
+		fd = 3;
+		goto got_fd;
+	}
 #endif
-	  if ((tfd = open("/dev/tty", O_RDWR, 0)) < 0) {
-		tty_devtty = false;
-		if (need_tty)
-			warningf(false, "%s: %s %s: %s",
-			    "No controlling tty", "open", "/dev/tty",
-			    strerror(errno));
+	if ((fd = open("/dev/tty", O_RDWR, 0)) >= 0) {
+		do_close = true;
+		goto got_fd;
 	}
-	if (tfd < 0) {
-		do_close = false;
-		if (isatty(0))
-			tfd = 0;
-		else if (isatty(2))
-			tfd = 2;
-		else {
-			if (need_tty)
-				warningf(false, "can't find tty fd");
-			return;
-		}
-	}
-	if ((tty_fd = fcntl(tfd, F_DUPFD, FDBASE)) < 0) {
-		if (need_tty)
-			warningf(false, "%s: %s %s: %s", "j_ttyinit",
-			    "dup of tty fd", "failed", strerror(errno));
-	} else if (fcntl(tty_fd, F_SETFD, FD_CLOEXEC) < 0) {
-		if (need_tty)
-			warningf(false, "%s: %s: %s", "j_ttyinit",
-			    "can't set close-on-exec flag", strerror(errno));
-		close(tty_fd);
-		tty_fd = -1;
-	} else if (init_ttystate)
-		tcgetattr(tty_fd, &tty_state);
-	if (do_close)
-		close(tfd);
-}
+	eno = errno;
 
-void
-tty_close(void)
-{
 	if (tty_fd >= 0) {
-		close(tty_fd);
-		tty_fd = -1;
+		/* already got a non-devtty one */
+		rv = 1;
+		goto out;
 	}
+	is_devtty = false;
+
+	if (isatty((fd = 0)) || isatty((fd = 2)))
+		goto got_fd;
+	/* cannot find one */
+	rv = 2;
+	/* assert: do_close == false */
+	goto out;
+
+ got_fd:
+	if ((rv = fcntl(fd, F_DUPFD, FDBASE)) < 0) {
+		eno = errno;
+		rv = 3;
+		goto out;
+	}
+	if (fcntl(rv, F_SETFD, FD_CLOEXEC) < 0) {
+		eno = errno;
+		close(rv);
+		rv = 4;
+		goto out;
+	}
+	tty_fd = rv;
+	tty_devtty = is_devtty;
+	rv = eno = 0;
+ out:
+	if (do_close)
+		close(fd);
+	errno = eno;
+	return (rv);
 }
 
 /* A shell error occurred (eg, syntax error, etc.) */
@@ -1053,7 +1166,7 @@ static void vwarningf(unsigned int, const char *, va_list)
 static void
 vwarningf(unsigned int flags, const char *fmt, va_list ap)
 {
-	if (*fmt != 1) {
+	if (fmt) {
 		if (flags & VWARNINGF_INTERNAL)
 			shf_fprintf(shl_out, "internal error: ");
 		if (flags & VWARNINGF_ERRORPREFIX)
@@ -1136,7 +1249,7 @@ bi_errorf(const char *fmt, ...)
 	 * non-interactive shells to exit.
 	 * XXX odd use of KEEPASN; also may not want LERROR here
 	 */
-	if (builtin_flag & SPEC_BI) {
+	if (builtin_spec) {
 		builtin_argv0 = NULL;
 		unwind(LERROR);
 	}
@@ -1173,8 +1286,9 @@ error_prefix(bool fileline)
 	    strcmp(source->file, kshname) != 0)
 		shf_fprintf(shl_out, "%s: ", kshname + (*kshname == '-'));
 	if (fileline && source && source->file != NULL) {
-		shf_fprintf(shl_out, "%s[%d]: ", source->file,
-		    source->errline > 0 ? source->errline : source->line);
+		shf_fprintf(shl_out, "%s[%lu]: ", source->file,
+		    (unsigned long)(source->errline ?
+		    source->errline : source->line));
 		source->errline = 0;
 	}
 }
@@ -1217,17 +1331,47 @@ can_seek(int fd)
 	    SHF_UNBUF : 0);
 }
 
-struct shf shf_iob[3];
+#ifdef DF
+int shl_dbg_fd;
+#define NSHF_IOB 4
+#else
+#define NSHF_IOB 3
+#endif
+struct shf shf_iob[NSHF_IOB];
 
 void
 initio(void)
 {
+#ifdef DF
+	const char *lfp;
+#endif
+
 	/* force buffer allocation */
 	shf_fdopen(1, SHF_WR, shl_stdout);
 	shf_fdopen(2, SHF_WR, shl_out);
-	/* force buffer allocation */
-	shf_fdopen(2, SHF_WR, shl_spare);
-	initio_done = 1;
+	shf_fdopen(2, SHF_WR, shl_xtrace);
+#ifdef DF
+	if ((lfp = getenv("SDMKSH_PATH")) == NULL) {
+		if ((lfp = getenv("HOME")) == NULL || *lfp != '/')
+			errorf("cannot get home directory");
+		lfp = shf_smprintf("%s/mksh-dbg.txt", lfp);
+	}
+
+	if ((shl_dbg_fd = open(lfp, O_WRONLY | O_APPEND | O_CREAT, 0600)) < 0)
+		errorf("cannot open debug output file %s", lfp);
+	if (shl_dbg_fd < FDBASE) {
+		int nfd;
+
+		nfd = fcntl(shl_dbg_fd, F_DUPFD, FDBASE);
+		close(shl_dbg_fd);
+		if ((shl_dbg_fd = nfd) == -1)
+			errorf("cannot dup debug output file");
+	}
+	fcntl(shl_dbg_fd, F_SETFD, FD_CLOEXEC);
+	shf_fdopen(shl_dbg_fd, SHF_WR, shl_dbg);
+	DF("=== open ===");
+#endif
+	initio_done = true;
 }
 
 /* A dup2() with error checking */
@@ -1270,7 +1414,7 @@ void
 restfd(int fd, int ofd)
 {
 	if (fd == 2)
-		shf_flush(&shf_iob[fd]);
+		shf_flush(&shf_iob[/* fd */ 2]);
 	if (ofd < 0)
 		/* original fd closed */
 		close(fd);
@@ -1310,13 +1454,20 @@ closepipe(int *pv)
 int
 check_fd(const char *name, int mode, const char **emsgp)
 {
-	int fd, fl;
+	int fd = 0, fl;
 
 	if (name[0] == 'p' && !name[1])
 		return (coproc_getfd(mode, emsgp));
-	for (fd = 0; ksh_isdigit(*name); ++name)
+	while (ksh_isdigit(*name)) {
 		fd = (fd * 10) + *name - '0';
-	if (*name || fd >= FDBASE) {
+		if (fd >= FDBASE) {
+			if (emsgp)
+				*emsgp = "file descriptor too large";
+			return (-1);
+		}
+		++name;
+	}
+	if (*name) {
 		if (emsgp)
 			*emsgp = "illegal file descriptor name";
 		return (-1);
@@ -1433,42 +1584,74 @@ coproc_cleanup(int reuse)
 struct temp *
 maketemp(Area *ap, Temp_type type, struct temp **tlist)
 {
-	struct temp *tp;
+	char *cp;
 	size_t len;
-	int fd;
-	char *pathname;
+	int i, j;
+	struct temp *tp;
 	const char *dir;
+	struct stat sb;
 
 	dir = tmpdir ? tmpdir : MKSH_DEFAULT_TMPDIR;
-#if HAVE_MKSTEMP
-	len = strlen(dir) + 6 + 10 + 1;
-#else
-	pathname = tempnam(dir, "mksh.");
-	len = ((pathname == NULL) ? 0 : strlen(pathname)) + 1;
-#endif
-	/* reasonably sure that this will not overflow */
-	tp = alloc(sizeof(struct temp) + len, ap);
-	tp->name = (char *)&tp[1];
-#if !HAVE_MKSTEMP
-	if (pathname == NULL)
-		tp->name[0] = '\0';
-	else {
-		memcpy(tp->name, pathname, len);
-		free_ostempnam(pathname);
-	}
-#endif
-	pathname = tp->name;
-	tp->shf = NULL;
-	tp->type = type;
-#if HAVE_MKSTEMP
-	shf_snprintf(pathname, len, "%s%s", dir, "/mksh.XXXXXXXXXX");
-	if ((fd = mkstemp(pathname)) >= 0)
-#else
-	if (tp->name[0] && (fd = open(tp->name, O_CREAT | O_RDWR, 0600)) >= 0)
-#endif
-		tp->shf = shf_fdopen(fd, SHF_WR, NULL);
-	tp->pid = procpid;
+	/* add "/shXXXXXX.tmp" plus NUL */
+	len = strlen(dir);
+	checkoktoadd(len, offsetof(struct temp, tffn[0]) + 14);
+	tp = alloc(offsetof(struct temp, tffn[0]) + 14 + len, ap);
 
+	tp->shf = NULL;
+	tp->pid = procpid;
+	tp->type = type;
+
+	if (stat(dir, &sb) || !S_ISDIR(sb.st_mode)) {
+		tp->tffn[0] = '\0';
+		goto maketemp_out;
+	}
+
+	cp = (void *)tp;
+	cp += offsetof(struct temp, tffn[0]);
+	memcpy(cp, dir, len);
+	cp += len;
+	memcpy(cp, "/shXXXXXX.tmp", 14);
+	/* point to the first of six Xes */
+	cp += 3;
+	/* generate random part of filename */
+	len = -1;
+	do {
+		i = rndget() % 36;
+		cp[++len] = i < 26 ? 'a' + i : '0' + i - 26;
+	} while (len < 5);
+
+	/* cyclically attempt to open a temporary file */
+	while ((i = open(tp->tffn, O_CREAT | O_EXCL | O_RDWR | O_BINARY,
+	    0600)) < 0) {
+		if (errno != EEXIST)
+			goto maketemp_out;
+		/* count down from z to a then from 9 to 0 */
+		while (cp[len] == '0')
+			if (!len--)
+				goto maketemp_out;
+		if (cp[len] == 'a')
+			cp[len] = '9';
+		else
+			--cp[len];
+		/* do another cycle */
+	}
+
+	if (type == TT_FUNSUB) {
+		/* map us high and mark as close-on-exec */
+		if ((j = savefd(i)) != i) {
+			close(i);
+			i = j;
+		}
+
+		/* operation mode for the shf */
+		j = SHF_RD;
+	} else
+		j = SHF_WR;
+
+	/* shf_fdopen cannot fail, so no fd leak */
+	tp->shf = shf_fdopen(i, j, NULL);
+
+ maketemp_out:
 	tp->next = *tlist;
 	*tlist = tp;
 	return (tp);
@@ -1503,8 +1686,10 @@ tgrow(struct table *tp)
 	/* multiplication cannot overflow: alloc2 checked that */
 	memset(ntblp, 0, i * sizeof(struct tbl *));
 
-	/* table can get 80% full except when reaching its limit */
-	tp->nfree = (tp->tshift == 30) ? 0x3FFF0000UL : ((i * 4) / 5);
+	/* table can get very full when reaching its size limit */
+	tp->nfree = (tp->tshift == 30) ? 0x3FFF0000UL :
+	    /* but otherwise, only 75% */
+	    ((i * 3) / 4);
 	tp->tbls = ntblp;
 	if (otblp == NULL)
 		return;
@@ -1514,7 +1699,7 @@ tgrow(struct table *tp)
 		if ((tblp = otblp[i]) != NULL) {
 			if ((tblp->flag & DEFINED)) {
 				/* search for free hash table slot */
-				j = (perturb = tblp->ua.hval) & mask;
+				j = perturb = tblp->ua.hval;
 				goto find_first_empty_slot;
  find_next_empty_slot:
 				j = (j << 2) + j + perturb + 1;
@@ -1552,7 +1737,7 @@ ktscan(struct table *tp, const char *name, uint32_t h, struct tbl ***ppp)
 
 	mask = ((size_t)1 << (tp->tshift)) - 1;
 	/* search for hash table slot matching name */
-	j = (perturb = h) & mask;
+	j = perturb = h;
 	goto find_first_slot;
  find_next_slot:
 	j = (j << 2) + j + perturb + 1;
@@ -1662,3 +1847,59 @@ x_sigwinch(int sig MKSH_A_UNUSED)
 	got_winch = 1;
 }
 #endif
+
+#ifdef DF
+void
+DF(const char *fmt, ...)
+{
+	va_list args;
+	struct timeval tv;
+	mirtime_mjd mjd;
+
+	mksh_lockfd(shl_dbg_fd);
+	mksh_TIME(tv);
+	timet2mjd(&mjd, tv.tv_sec);
+	shf_fprintf(shl_dbg, "[%02u:%02u:%02u (%u) %u.%06u] ",
+	    (unsigned)mjd.sec / 3600, ((unsigned)mjd.sec / 60) % 60,
+	    (unsigned)mjd.sec % 60, (unsigned)getpid(),
+	    (unsigned)tv.tv_sec, (unsigned)tv.tv_usec);
+	va_start(args, fmt);
+	shf_vfprintf(shl_dbg, fmt, args);
+	va_end(args);
+	shf_putc('\n', shl_dbg);
+	shf_flush(shl_dbg);
+	mksh_unlkfd(shl_dbg_fd);
+}
+#endif
+
+void
+x_mkraw(int fd, mksh_ttyst *ocb, bool forread)
+{
+	mksh_ttyst cb;
+
+	if (ocb)
+		mksh_tcget(fd, ocb);
+	else
+		ocb = &tty_state;
+
+	cb = *ocb;
+	if (forread) {
+		cb.c_iflag &= ~(ISTRIP);
+		cb.c_lflag &= ~(ICANON) | ECHO;
+	} else {
+		cb.c_iflag &= ~(INLCR | ICRNL | ISTRIP);
+		cb.c_lflag &= ~(ISIG | ICANON | ECHO);
+	}
+#if defined(VLNEXT) && defined(_POSIX_VDISABLE)
+	/* OSF/1 processes lnext when ~icanon */
+	cb.c_cc[VLNEXT] = _POSIX_VDISABLE;
+#endif
+	/* SunOS 4.1.x & OSF/1 processes discard(flush) when ~icanon */
+#if defined(VDISCARD) && defined(_POSIX_VDISABLE)
+	cb.c_cc[VDISCARD] = _POSIX_VDISABLE;
+#endif
+	cb.c_cc[VTIME] = 0;
+	cb.c_cc[VMIN] = 1;
+
+	mksh_tcset(fd, &cb);
+}

@@ -1,7 +1,8 @@
-/*	$OpenBSD: var.c,v 1.34 2007/10/15 02:16:35 deraadt Exp $	*/
+/*	$OpenBSD: var.c,v 1.38 2013/12/20 17:53:09 zhuk Exp $	*/
 
 /*-
- * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010, 2011
+ * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
+ *		 2011, 2012, 2013, 2014, 2015
  *	Thorsten Glaser <tg@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -21,12 +22,13 @@
  */
 
 #include "sh.h"
+#include "mirhash.h"
 
 #if defined(__OpenBSD__)
 #include <sys/sysctl.h>
 #endif
 
-__RCSID("$MirOS: src/bin/mksh/var.c,v 1.132 2011/09/07 15:24:22 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/var.c,v 1.183.2.4 2015/04/19 19:18:23 tg Exp $");
 
 /*-
  * Variables
@@ -38,9 +40,10 @@ __RCSID("$MirOS: src/bin/mksh/var.c,v 1.132 2011/09/07 15:24:22 tg Exp $");
  * if (flag&EXPORT), val.s contains "name=value" for E-Z exporting.
  */
 
-static struct tbl vtemp;
 static struct table specials;
-static uint32_t lcg_state = 5381;
+static uint32_t lcg_state = 5381, qh_state = 4711;
+/* may only be set by typeset() just before call to array_index_calc() */
+static enum namerefflag innermost_refflag = SRF_NOP;
 
 static char *formatstr(struct tbl *, const char *);
 static void exportprep(struct tbl *, const char *);
@@ -49,7 +52,7 @@ static void unspecial(const char *);
 static void getspec(struct tbl *);
 static void setspec(struct tbl *);
 static void unsetspec(struct tbl *);
-static int getint(struct tbl *, mksh_ari_t *, bool);
+static int getint(struct tbl *, mksh_ari_u *, bool);
 static const char *array_index_calc(const char *, bool *, uint32_t *);
 
 /*
@@ -130,8 +133,8 @@ initvar(void)
 	struct tbl *tp;
 
 	ktinit(APERM, &specials,
-	    /* currently 12 specials -> 80% of 16 (2^4) */
-	    4);
+	    /* currently 14 specials: 75% of 32 = 2^5 */
+	    5);
 	while (i < V_MAX - 1) {
 		tp = ktenter(&specials, initvar_names[i],
 		    hash(initvar_names[i]));
@@ -140,8 +143,8 @@ initvar(void)
 	}
 }
 
-/* common code for several functions below */
-static struct block *
+/* common code for several functions below and c_typeset() */
+struct block *
 varsearch(struct block *l, struct tbl **vpp, const char *vn, uint32_t h)
 {
 	register struct tbl *vp;
@@ -164,7 +167,8 @@ varsearch(struct block *l, struct tbl **vpp, const char *vn, uint32_t h)
 /*
  * Used to calculate an array index for global()/local(). Sets *arrayp
  * to true if this is an array, sets *valp to the array index, returns
- * the basename of the array.
+ * the basename of the array. May only be called from global()/local()
+ * and must be their first callee.
  */
 static const char *
 array_index_calc(const char *n, bool *arrayp, uint32_t *valp)
@@ -176,7 +180,7 @@ array_index_calc(const char *n, bool *arrayp, uint32_t *valp)
 	*arrayp = false;
  redo_from_ref:
 	p = skip_varname(n, false);
-	if (set_refflag == SRF_NOP && (p != n) && ksh_isalphx(n[0])) {
+	if (innermost_refflag == SRF_NOP && (p != n) && ksh_isalphx(n[0])) {
 		struct tbl *vp;
 		char *vn;
 
@@ -184,8 +188,8 @@ array_index_calc(const char *n, bool *arrayp, uint32_t *valp)
 		/* check if this is a reference */
 		varsearch(e->loc, &vp, vn, hash(vn));
 		afree(vn, ATEMP);
-		if (vp && (vp->flag & (DEFINED|ASSOC|ARRAY)) ==
-		    (DEFINED|ASSOC)) {
+		if (vp && (vp->flag & (DEFINED | ASSOC | ARRAY)) ==
+		    (DEFINED | ASSOC)) {
 			char *cp;
 
 			/* gotcha! */
@@ -195,6 +199,7 @@ array_index_calc(const char *n, bool *arrayp, uint32_t *valp)
 			goto redo_from_ref;
 		}
 	}
+	innermost_refflag = SRF_NOP;
 
 	if (p != n && *p == '[' && (len = array_ref_len(p))) {
 		char *sub, *tmp;
@@ -225,10 +230,13 @@ global(const char *n)
 	bool array;
 	uint32_t h, val;
 
-	/* Check to see if this is an array */
+	/*
+	 * check to see if this is an array;
+	 * dereference namerefs; must come first
+	 */
 	n = array_index_calc(n, &array, &val);
 	h = hash(n);
-	c = n[0];
+	c = (unsigned char)n[0];
 	if (!ksh_isalphx(c)) {
 		if (array)
 			errorf("bad substitution");
@@ -238,9 +246,7 @@ global(const char *n)
 		vp->areap = ATEMP;
 		*vp->name = c;
 		if (ksh_isdigit(c)) {
-			for (c = 0; ksh_isdigit(*n); n++)
-				c = c*10 + *n-'0';
-			if (c <= l->argc)
+			if (getn(n, &c) && (c <= l->argc))
 				/* setstr can't fail here */
 				setstr(vp, l->argv[c], KSH_RETURN_ERROR);
 			vp->flag |= RDONLY;
@@ -260,7 +266,7 @@ global(const char *n)
 				vp->flag &= ~(ISSET|INTEGER);
 			break;
 		case '?':
-			vp->val.i = exstat;
+			vp->val.i = exstat & 0xFF;
 			break;
 		case '#':
 			vp->val.i = l->argc;
@@ -297,7 +303,10 @@ local(const char *n, bool copy)
 	bool array;
 	uint32_t h, val;
 
-	/* check to see if this is an array */
+	/*
+	 * check to see if this is an array;
+	 * dereference namerefs; must come first
+	 */
 	n = array_index_calc(n, &array, &val);
 	h = hash(n);
 	if (!ksh_isalphx(*n)) {
@@ -346,7 +355,7 @@ str_val(struct tbl *vp)
 	else {
 		/* integer source */
 		mksh_uari_t n;
-		int base;
+		unsigned int base;
 		/**
 		 * worst case number length is when base == 2:
 		 *	1 (minus) + 2 (base, up to 36) + 1 ('#') +
@@ -360,8 +369,8 @@ str_val(struct tbl *vp)
 		if (vp->flag & INT_U)
 			n = vp->val.u;
 		else
-			n = (vp->val.i < 0) ? -vp->val.i : vp->val.i;
-		base = (vp->type == 0) ? 10 : vp->type;
+			n = (vp->val.i < 0) ? -vp->val.u : vp->val.u;
+		base = (vp->type == 0) ? 10U : (unsigned int)vp->type;
 
 		if (base == 1 && n == 0)
 			base = 2;
@@ -405,11 +414,11 @@ int
 setstr(struct tbl *vq, const char *s, int error_ok)
 {
 	char *salloc = NULL;
-	int no_ro_check = error_ok & 0x4;
+	bool no_ro_check = tobool(error_ok & 0x4);
 
 	error_ok &= ~0x4;
 	if ((vq->flag & RDONLY) && !no_ro_check) {
-		warningf(true, "%s: %s", vq->name, "is read only");
+		warningf(true, "read-only: %s", vq->name);
 		if (!error_ok)
 			errorfxz(2);
 		return (0);
@@ -417,12 +426,15 @@ setstr(struct tbl *vq, const char *s, int error_ok)
 	if (!(vq->flag&INTEGER)) {
 		/* string dest */
 		if ((vq->flag&ALLOC)) {
+#ifndef MKSH_SMALL
 			/* debugging */
 			if (s >= vq->val.s &&
-			    s <= vq->val.s + strlen(vq->val.s))
+			    s <= vq->val.s + strlen(vq->val.s)) {
 				internal_errorf(
 				    "setstr: %s=%s: assigning to self",
 				    vq->name, s);
+			}
+#endif
 			afree(vq->val.s, vq->areap);
 		}
 		vq->flag &= ~(ISSET|ALLOC);
@@ -467,51 +479,63 @@ setint(struct tbl *vq, mksh_ari_t n)
 }
 
 static int
-getint(struct tbl *vp, mksh_ari_t *nump, bool arith)
+getint(struct tbl *vp, mksh_ari_u *nump, bool arith)
 {
-	char *s;
-	int c, base, neg;
-	bool have_base = false;
-	mksh_ari_t num;
+	mksh_uari_t c, num = 0, base = 10;
+	const char *s;
+	bool have_base = false, neg = false;
 
-	if (vp->flag&SPECIAL)
+	if (vp->flag & SPECIAL)
 		getspec(vp);
-	/* XXX is it possible for ISSET to be set and val.s to be 0? */
-	if (!(vp->flag&ISSET) || (!(vp->flag&INTEGER) && vp->val.s == NULL))
+	/* XXX is it possible for ISSET to be set and val.s to be NULL? */
+	if (!(vp->flag & ISSET) || (!(vp->flag & INTEGER) && vp->val.s == NULL))
 		return (-1);
-	if (vp->flag&INTEGER) {
-		*nump = vp->val.i;
+	if (vp->flag & INTEGER) {
+		nump->i = vp->val.i;
 		return (vp->type);
 	}
 	s = vp->val.s + vp->type;
-	base = 10;
-	num = 0;
-	neg = 0;
-	if (arith && *s == '0' && *(s+1)) {
-		s++;
-		if (*s == 'x' || *s == 'X') {
-			s++;
-			base = 16;
-		} else if (vp->flag & ZEROFIL) {
-			while (*s == '0')
-				s++;
-		} else
-			base = 8;
-		have_base = true;
+
+	do {
+		c = (unsigned char)*s++;
+	} while (ksh_isspace(c));
+
+	switch (c) {
+	case '-':
+		neg = true;
+		/* FALLTHROUGH */
+	case '+':
+		c = (unsigned char)*s++;
+		break;
 	}
-	for (c = *s++; c ; c = *s++) {
-		if (c == '-') {
-			neg++;
-			continue;
-		} else if (c == '#') {
-			base = (int)num;
-			if (have_base || base < 1 || base > 36)
+
+	if (c == '0' && arith) {
+		if ((s[0] | 0x20) == 'x') {
+			/* interpret as hexadecimal */
+			base = 16;
+			++s;
+			goto getint_c_style_base;
+		} else if (Flag(FPOSIX) && ksh_isdigit(s[0]) &&
+		    !(vp->flag & ZEROFIL)) {
+			/* interpret as octal (deprecated) */
+			base = 8;
+ getint_c_style_base:
+			have_base = true;
+			c = (unsigned char)*s++;
+		}
+	}
+
+	do {
+		if (c == '#') {
+			/* ksh-style base determination */
+			if (have_base || num < 1)
 				return (-1);
-			if (base == 1) {
+			if ((base = num) == 1) {
+				/* mksh-specific extension */
 				unsigned int wc;
 
 				if (!UTFMODE)
-					wc = *(unsigned char *)s;
+					wc = *(const unsigned char *)s;
 				else if (utf_mbtowc(&wc, s) == (size_t)-1)
 					/* OPTU-8 -> OPTU-16 */
 					/*
@@ -519,28 +543,32 @@ getint(struct tbl *vp, mksh_ari_t *nump, bool arith)
 					 * the same as 1#\x80 does, thus is
 					 * not round-tripping correctly XXX)
 					 */
-					wc = 0xEF00 + *(unsigned char *)s;
-				*nump = (mksh_ari_t)wc;
+					wc = 0xEF00 + *(const unsigned char *)s;
+				nump->u = (mksh_uari_t)wc;
 				return (1);
-			}
+			} else if (base > 36)
+				return (-1);
 			num = 0;
 			have_base = true;
 			continue;
-		} else if (ksh_isdigit(c))
+		}
+		if (ksh_isdigit(c))
 			c -= '0';
-		else if (ksh_islower(c))
+		else {
+			c |= 0x20;
+			if (!ksh_islower(c))
+				return (-1);
 			c -= 'a' - 10;
-		else if (ksh_isupper(c))
-			c -= 'A' - 10;
-		else
+		}
+		if (c >= base)
 			return (-1);
-		if (c < 0 || c >= base)
-			return (-1);
+		/* handle overflow as truncation */
 		num = num * base + c;
-	}
+	} while ((c = (unsigned char)*s++));
+
 	if (neg)
 		num = -num;
-	*nump = num;
+	nump->u = num;
 	return (base);
 }
 
@@ -552,11 +580,11 @@ struct tbl *
 setint_v(struct tbl *vq, struct tbl *vp, bool arith)
 {
 	int base;
-	mksh_ari_t num;
+	mksh_ari_u num;
 
 	if ((base = getint(vp, &num, arith)) == -1)
 		return (NULL);
-	setint_n(vq, num);
+	setint_n(vq, num.i, 0);
 	if (vq->type == 0)
 		/* default base */
 		vq->type = base;
@@ -565,7 +593,7 @@ setint_v(struct tbl *vq, struct tbl *vp, bool arith)
 
 /* convert variable vq to integer variable, setting its value to num */
 void
-setint_n(struct tbl *vq, mksh_ari_t num)
+setint_n(struct tbl *vq, mksh_ari_t num, int newbase)
 {
 	if (!(vq->flag & INTEGER) && (vq->flag & ALLOC)) {
 		vq->flag &= ~ALLOC;
@@ -573,6 +601,8 @@ setint_n(struct tbl *vq, mksh_ari_t num)
 		afree(vq->val.s, vq->areap);
 	}
 	vq->val.i = num;
+	if (newbase != 0)
+		vq->type = newbase;
 	vq->flag |= ISSET|INTEGER;
 	if (vq->flag&SPECIAL)
 		setspec(vq);
@@ -611,10 +641,13 @@ formatstr(struct tbl *vp, const char *s)
 				--slen;
 			}
 			if (vp->flag & ZEROFIL && vp->flag & INTEGER) {
+				if (!s[0] || !s[1])
+					goto uhm_no;
 				if (s[1] == '#')
 					n = 2;
 				else if (s[2] == '#')
 					n = 3;
+ uhm_no:
 				if (vp->u2.field <= n)
 					n = 0;
 			}
@@ -695,15 +728,25 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 	const char *val;
 	size_t len;
 	bool vappend = false;
+	enum namerefflag new_refflag = SRF_NOP;
+
+	if ((set & (ARRAY | ASSOC)) == ASSOC) {
+		new_refflag = SRF_ENABLE;
+		set &= ~(ARRAY | ASSOC);
+	}
+	if ((clr & (ARRAY | ASSOC)) == ASSOC) {
+		new_refflag = SRF_DISABLE;
+		clr &= ~(ARRAY | ASSOC);
+	}
 
 	/* check for valid variable name, search for value */
 	val = skip_varname(var, false);
-	if (val == var)
+	if (val == var) {
+		/* no variable name given */
 		return (NULL);
-	mkssert(var != NULL);
-	mkssert(*var != 0);
+	}
 	if (*val == '[') {
-		if (set_refflag != SRF_NOP)
+		if (new_refflag != SRF_NOP)
 			errorf("%s: %s", var,
 			    "reference variable can't be an array");
 		len = array_ref_len(val);
@@ -713,7 +756,7 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 		 * IMPORT is only used when the shell starts up and is
 		 * setting up its environment. Allow only simple array
 		 * references at this time since parameter/command
-		 * substitution is preformed on the [expression] which
+		 * substitution is performed on the [expression] which
 		 * would be a major security hole.
 		 */
 		if (set & IMPORT) {
@@ -725,16 +768,21 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 		}
 		val += len;
 	}
-	if (val[0] == '=' || (val[0] == '+' && val[1] == '=')) {
+	if (val[0] == '=') {
 		strndupx(tvar, var, val - var, ATEMP);
-		if (*val++ == '+') {
-			++val;
-			vappend = true;
-		}
+		++val;
+	} else if (set & IMPORT) {
+		/* environment invalid variable name or no assignment */
+		return (NULL);
+	} else if (val[0] == '+' && val[1] == '=') {
+		strndupx(tvar, var, val - var, ATEMP);
+		val += 2;
+		vappend = true;
+	} else if (val[0] != '\0') {
+		/* other invalid variable names (not from environment) */
+		return (NULL);
 	} else {
-		/* importing from original environment: must have an = */
-		if (set & IMPORT)
-			return (NULL);
+		/* just varname with no value part nor equals sign */
 		strdupx(tvar, var, ATEMP);
 		val = NULL;
 		/* handle foo[*] => foo (whole array) mapping for R39b */
@@ -744,22 +792,58 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 			tvar[len - 3] = '\0';
 	}
 
-	if (set_refflag == SRF_ENABLE) {
-		const char *qval;
+	if (new_refflag == SRF_ENABLE) {
+		const char *qval, *ccp;
 
 		/* bail out on 'nameref foo+=bar' */
 		if (vappend)
-			errorfz();
+			errorf("appending not allowed for nameref");
 		/* find value if variable already exists */
 		if ((qval = val) == NULL) {
 			varsearch(e->loc, &vp, tvar, hash(tvar));
-			if (vp != NULL)
-				qval = str_val(vp);
+			if (vp == NULL)
+				goto nameref_empty;
+			qval = str_val(vp);
 		}
-		/* silently ignore 'nameref foo=foo' */
-		if (qval != NULL && !strcmp(qval, tvar)) {
-			afree(tvar, ATEMP);
-			return (&vtemp);
+		/* check target value for being a valid variable name */
+		ccp = skip_varname(qval, false);
+		if (ccp == qval) {
+			if (ksh_isdigit(qval[0])) {
+				int c;
+
+				if (getn(qval, &c))
+					goto nameref_rhs_checked;
+			} else if (qval[1] == '\0') switch (qval[0]) {
+			case '$':
+			case '!':
+			case '?':
+			case '#':
+			case '-':
+				goto nameref_rhs_checked;
+			}
+ nameref_empty:
+			errorf("%s: %s", var, "empty nameref target");
+		}
+		len = (*ccp == '[') ? array_ref_len(ccp) : 0;
+		if (ccp[len]) {
+			/*
+			 * works for cases "no array", "valid array with
+			 * junk after it" and "invalid array"; in the
+			 * latter case, len is also 0 and points to '['
+			 */
+			errorf("%s: %s", qval,
+			    "nameref target not a valid parameter name");
+		}
+ nameref_rhs_checked:
+		/* prevent nameref loops */
+		while (qval) {
+			if (!strcmp(qval, tvar))
+				errorf("%s: %s", qval,
+				    "expression recurses on parameter");
+			varsearch(e->loc, &vp, qval, hash(qval));
+			qval = NULL;
+			if (vp && ((vp->flag & (ARRAY | ASSOC)) == ASSOC))
+				qval = str_val(vp);
 		}
 	}
 
@@ -768,11 +852,12 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 	    strcmp(tvar, "ENV") == 0 || strcmp(tvar, "SHELL") == 0))
 		errorf("%s: %s", tvar, "restricted");
 
-	vp = (set&LOCAL) ? local(tvar, tobool(set & LOCAL_COPY)) :
+	innermost_refflag = new_refflag;
+	vp = (set & LOCAL) ? local(tvar, tobool(set & LOCAL_COPY)) :
 	    global(tvar);
-	if (set_refflag == SRF_DISABLE && (vp->flag & (ARRAY|ASSOC)) == ASSOC)
+	if (new_refflag == SRF_DISABLE && (vp->flag & (ARRAY|ASSOC)) == ASSOC)
 		vp->flag &= ~ASSOC;
-	else if (set_refflag == SRF_ENABLE) {
+	else if (new_refflag == SRF_ENABLE) {
 		if (vp->flag & ARRAY) {
 			struct tbl *a, *tmp;
 
@@ -792,17 +877,17 @@ typeset(const char *var, uint32_t set, uint32_t clr, int field, int base)
 
 	set &= ~(LOCAL|LOCAL_COPY);
 
-	vpbase = (vp->flag & ARRAY) ? global(arrayname(var)) : vp;
+	vpbase = (vp->flag & ARRAY) ? global(arrayname(tvar)) : vp;
 
 	/*
 	 * only allow export flag to be set; AT&T ksh allows any
 	 * attribute to be changed which means it can be truncated or
 	 * modified (-L/-R/-Z/-i)
 	 */
-	if ((vpbase->flag&RDONLY) &&
+	if ((vpbase->flag & RDONLY) &&
 	    (val || clr || (set & ~EXPORT)))
 		/* XXX check calls - is error here ok by POSIX? */
-		errorfx(2, "%s: %s", tvar, "is read only");
+		errorfx(2, "read-only: %s", tvar);
 	afree(tvar, ATEMP);
 
 	/* most calls are with set/clr == 0 */
@@ -943,7 +1028,7 @@ unset(struct tbl *vp, int flags)
  * the terminating NUL if whole string is legal).
  */
 const char *
-skip_varname(const char *s, int aok)
+skip_varname(const char *s, bool aok)
 {
 	size_t alen;
 
@@ -1046,6 +1131,8 @@ makenv(void)
 				}
 				XPput(denv, vp->val.s);
 			}
+		if (l->flags & BF_STOPENV)
+			break;
 	}
 	XPput(denv, NULL);
 	return ((char **)XPclose(denv));
@@ -1077,45 +1164,16 @@ unspecial(const char *name)
 }
 
 static time_t seconds;		/* time SECONDS last set */
-static int user_lineno;		/* what user set $LINENO to */
+static mksh_uari_t user_lineno;	/* what user set $LINENO to */
 
 static void
 getspec(struct tbl *vp)
 {
-	register mksh_ari_t i;
+	mksh_ari_u num;
 	int st;
+	struct timeval tv;
 
 	switch ((st = special(vp->name))) {
-	case V_SECONDS:
-		/*
-		 * On start up the value of SECONDS is used before
-		 * it has been set - don't do anything in this case
-		 * (see initcoms[] in main.c).
-		 */
-		if (vp->flag & ISSET) {
-			struct timeval tv;
-
-			gettimeofday(&tv, NULL);
-			i = tv.tv_sec - seconds;
-		} else
-			return;
-		break;
-	case V_RANDOM:
-		/*
-		 * this is the same Linear Congruential PRNG as Borland
-		 * C/C++ allegedly uses in its built-in rand() function
-		 */
-		i = ((lcg_state = 22695477 * lcg_state + 1) >> 16) & 0x7FFF;
-		break;
-	case V_HISTSIZE:
-		i = histsize;
-		break;
-	case V_OPTIND:
-		i = user_opt.uoptind;
-		break;
-	case V_LINENO:
-		i = current_lineno + user_lineno;
-		break;
 	case V_COLUMNS:
 	case V_LINES:
 		/*
@@ -1125,26 +1183,82 @@ getspec(struct tbl *vp)
 		 * and the window is then resized, the app won't
 		 * see the change cause the environ doesn't change.
 		 */
-		change_winsz();
-		i = st == V_COLUMNS ? x_cols : x_lins;
+		if (got_winch)
+			change_winsz();
+		break;
+	}
+	switch (st) {
+	case V_BASHPID:
+		num.u = (mksh_uari_t)procpid;
+		break;
+	case V_COLUMNS:
+		num.i = x_cols;
+		break;
+	case V_HISTSIZE:
+		num.i = histsize;
+		break;
+	case V_LINENO:
+		num.u = (mksh_uari_t)current_lineno + user_lineno;
+		break;
+	case V_LINES:
+		num.i = x_lins;
+		break;
+	case V_EPOCHREALTIME: {
+		/* 10(%u) + 1(.) + 6 + NUL */
+		char buf[18];
+
+		vp->flag &= ~SPECIAL;
+		mksh_TIME(tv);
+		shf_snprintf(buf, sizeof(buf), "%u.%06u",
+		    (unsigned)tv.tv_sec, (unsigned)tv.tv_usec);
+		setstr(vp, buf, KSH_RETURN_ERROR | 0x4);
+		vp->flag |= SPECIAL;
+		return;
+	}
+	case V_OPTIND:
+		num.i = user_opt.uoptind;
+		break;
+	case V_RANDOM:
+		num.i = rndget();
+		break;
+	case V_SECONDS:
+		/*
+		 * On start up the value of SECONDS is used before
+		 * it has been set - don't do anything in this case
+		 * (see initcoms[] in main.c).
+		 */
+		if (vp->flag & ISSET) {
+			mksh_TIME(tv);
+			num.i = tv.tv_sec - seconds;
+		} else
+			return;
 		break;
 	default:
 		/* do nothing, do not touch vp at all */
 		return;
 	}
 	vp->flag &= ~SPECIAL;
-	setint_n(vp, i);
+	setint_n(vp, num.i, 0);
 	vp->flag |= SPECIAL;
 }
 
 static void
 setspec(struct tbl *vp)
 {
-	mksh_ari_t i;
+	mksh_ari_u num;
 	char *s;
 	int st;
 
 	switch ((st = special(vp->name))) {
+#if HAVE_PERSISTENT_HISTORY
+	case V_HISTFILE:
+		sethistfile(str_val(vp));
+		return;
+#endif
+	case V_IFS:
+		setctypes(s = str_val(vp), C_IFS);
+		ifs0 = *s;
+		return;
 	case V_PATH:
 		if (path)
 			afree(path, APERM);
@@ -1152,10 +1266,6 @@ setspec(struct tbl *vp)
 		strdupx(path, s, APERM);
 		/* clear tracked aliases */
 		flushcom(true);
-		return;
-	case V_IFS:
-		setctypes(s = str_val(vp), C_IFS);
-		ifs0 = *s;
 		return;
 	case V_TMPDIR:
 		if (tmpdir) {
@@ -1176,27 +1286,28 @@ setspec(struct tbl *vp)
 				strdupx(tmpdir, s, APERM);
 		}
 		return;
-#if HAVE_PERSISTENT_HISTORY
-	case V_HISTFILE:
-		sethistfile(str_val(vp));
-		return;
-#endif
-
 	/* common sub-cases */
-	case V_OPTIND:
-	case V_HISTSIZE:
 	case V_COLUMNS:
 	case V_LINES:
+		if (vp->flag & IMPORT) {
+			/* do not touch */
+			unspecial(vp->name);
+			vp->flag &= ~SPECIAL;
+			return;
+		}
+		/* FALLTHROUGH */
+	case V_HISTSIZE:
+	case V_LINENO:
+	case V_OPTIND:
 	case V_RANDOM:
 	case V_SECONDS:
-	case V_LINENO:
 	case V_TMOUT:
 		vp->flag &= ~SPECIAL;
-		if (getint(vp, &i, false) == -1) {
+		if (getint(vp, &num, false) == -1) {
 			s = str_val(vp);
 			if (st != V_RANDOM)
 				errorf("%s: %s: %s", vp->name, "bad number", s);
-			i = hash(s);
+			num.u = hash(s);
 		}
 		vp->flag |= SPECIAL;
 		break;
@@ -1208,41 +1319,41 @@ setspec(struct tbl *vp)
 	/* process the singular parts of the common cases */
 
 	switch (st) {
-	case V_OPTIND:
-		getopts_reset((int)i);
+	case V_COLUMNS:
+		if (num.i >= MIN_COLS)
+			x_cols = num.i;
 		break;
 	case V_HISTSIZE:
-		sethistsize((int)i);
+		sethistsize(num.i);
 		break;
-	case V_COLUMNS:
-		if (i >= MIN_COLS)
-			x_cols = i;
+	case V_LINENO:
+		/* The -1 is because line numbering starts at 1. */
+		user_lineno = num.u - (mksh_uari_t)current_lineno - 1;
 		break;
 	case V_LINES:
-		if (i >= MIN_LINS)
-			x_lins = i;
+		if (num.i >= MIN_LINS)
+			x_lins = num.i;
+		break;
+	case V_OPTIND:
+		getopts_reset((int)num.i);
 		break;
 	case V_RANDOM:
 		/*
 		 * mksh R39d+ no longer has the traditional repeatability
 		 * of $RANDOM sequences, but always retains state
 		 */
-		rndset((long)i);
+		rndset((unsigned long)num.u);
 		break;
 	case V_SECONDS:
 		{
 			struct timeval tv;
 
-			gettimeofday(&tv, NULL);
-			seconds = tv.tv_sec - i;
+			mksh_TIME(tv);
+			seconds = tv.tv_sec - num.i;
 		}
 		break;
-	case V_LINENO:
-		/* The -1 is because line numbering starts at 1. */
-		user_lineno = (unsigned int)i - current_lineno - 1;
-		break;
 	case V_TMOUT:
-		ksh_tmout = i >= 0 ? i : 0;
+		ksh_tmout = num.i >= 0 ? num.i : 0;
 		break;
 	}
 }
@@ -1250,17 +1361,30 @@ setspec(struct tbl *vp)
 static void
 unsetspec(struct tbl *vp)
 {
+	/*
+	 * AT&T ksh man page says OPTIND, OPTARG and _ lose special
+	 * meaning, but OPTARG does not (still set by getopts) and _ is
+	 * also still set in various places. Don't know what AT&T does
+	 * for HISTSIZE, HISTFILE. Unsetting these in AT&T ksh does not
+	 * loose the 'specialness': IFS, COLUMNS, PATH, TMPDIR
+	 */
+
 	switch (special(vp->name)) {
+#if HAVE_PERSISTENT_HISTORY
+	case V_HISTFILE:
+		sethistfile(NULL);
+		return;
+#endif
+	case V_IFS:
+		setctypes(TC_IFSWS, C_IFS);
+		ifs0 = ' ';
+		break;
 	case V_PATH:
 		if (path)
 			afree(path, APERM);
 		strdupx(path, def_path, APERM);
 		/* clear tracked aliases */
 		flushcom(true);
-		break;
-	case V_IFS:
-		setctypes(" \t\n", C_IFS);
-		ifs0 = ' ';
 		break;
 	case V_TMPDIR:
 		/* should not become unspecial */
@@ -1276,14 +1400,6 @@ unsetspec(struct tbl *vp)
 		/* AT&T ksh leaves previous value in place */
 		unspecial(vp->name);
 		break;
-
-	/*
-	 * AT&T ksh man page says OPTIND, OPTARG and _ lose special
-	 * meaning, but OPTARG does not (still set by getopts) and _ is
-	 * also still set in various places. Don't know what AT&T does
-	 * for HISTSIZE, HISTFILE. Unsetting these in AT&T ksh does not
-	 * loose the 'specialness': IFS, COLUMNS, PATH, TMPDIR
-	 */
 	}
 }
 
@@ -1297,7 +1413,7 @@ arraysearch(struct tbl *vp, uint32_t val)
 	struct tbl *prev, *curr, *news;
 	size_t len;
 
-	vp->flag = (vp->flag | (ARRAY|DEFINED)) & ~ASSOC;
+	vp->flag = (vp->flag | (ARRAY | DEFINED)) & ~ASSOC;
 	/* the table entry is always [0] */
 	if (val == 0)
 		return (vp);
@@ -1337,6 +1453,8 @@ arraysearch(struct tbl *vp, uint32_t val)
  * Return the length of an array reference (eg, [1+2]) - cp is assumed
  * to point to the open bracket. Returns 0 if there is no matching
  * closing bracket.
+ *
+ * XXX this should parse the actual arithmetic syntax
  */
 size_t
 array_ref_len(const char *cp)
@@ -1377,39 +1495,35 @@ set_array(const char *var, bool reset, const char **vals)
 {
 	struct tbl *vp, *vq;
 	mksh_uari_t i = 0, j = 0;
-	const char *ccp;
-#ifndef MKSH_SMALL
+	const char *ccp = var;
 	char *cp = NULL;
 	size_t n;
-#endif
 
-	/* to get local array, use "typeset foo; set -A foo" */
-#ifndef MKSH_SMALL
+	/* to get local array, use "local foo; set -A foo" */
 	n = strlen(var);
 	if (n > 0 && var[n - 1] == '+') {
 		/* append mode */
 		reset = false;
 		strndupx(cp, var, n - 1, ATEMP);
+		ccp = cp;
 	}
-#define CPORVAR	(cp ? cp : var)
-#else
-#define CPORVAR	var
-#endif
-	vp = global(CPORVAR);
+	vp = global(ccp);
 
 	/* Note: AT&T ksh allows set -A but not set +A of a read-only var */
 	if ((vp->flag&RDONLY))
-		errorfx(2, "%s: %s", CPORVAR, "is read only");
+		errorfx(2, "read-only: %s", ccp);
 	/* This code is quite non-optimal */
-	if (reset)
+	if (reset) {
 		/* trash existing values and attributes */
 		unset(vp, 1);
+		/* allocate-by-access the [0] element to keep in scope */
+		arraysearch(vp, 0);
+	}
 	/*
 	 * TODO: would be nice for assignment to completely succeed or
 	 * completely fail. Only really effects integer arrays:
 	 * evaluation of some of vals[] may fail...
 	 */
-#ifndef MKSH_SMALL
 	if (cp != NULL) {
 		/* find out where to set when appending */
 		for (vq = vp; vq; vq = vq->u.array) {
@@ -1420,9 +1534,8 @@ set_array(const char *var, bool reset, const char **vals)
 		}
 		afree(cp, ATEMP);
 	}
-#endif
 	while ((ccp = vals[i])) {
-#ifndef MKSH_SMALL
+#if 0 /* temporarily taken out due to regression */
 		if (*ccp == '[') {
 			int level = 0;
 
@@ -1458,19 +1571,14 @@ set_array(const char *var, bool reset, const char **vals)
 void
 change_winsz(void)
 {
-	if (x_lins < 0) {
-		/* first time initialisation */
-#ifdef TIOCGWINSZ
-		if (tty_fd < 0)
-			/* non-FTALKING, try to get an fd anyway */
-			tty_init(true, false);
-#endif
-		x_cols = -1;
-	}
+	struct timeval tv;
+
+	mksh_TIME(tv);
+	BAFHUpdateMem_mem(qh_state, &tv, sizeof(tv));
 
 #ifdef TIOCGWINSZ
 	/* check if window size has changed */
-	if (tty_fd >= 0) {
+	if (tty_init_fd() < 2) {
 		struct winsize ws;
 
 		if (ioctl(tty_fd, TIOCGWINSZ, &ws) >= 0) {
@@ -1498,38 +1606,106 @@ hash(const void *s)
 {
 	register uint32_t h;
 
-	NZATInit(h);
-	NZATUpdateString(h, s);
-	NZATFinish(h);
+	BAFHInit(h);
+	BAFHUpdateStr_reg(h, s);
+	BAFHFinish_reg(h);
 	return (h);
 }
 
-void
-rndset(long v)
+uint32_t
+chvt_rndsetup(const void *bp, size_t sz)
 {
 	register uint32_t h;
 
-	NZATInit(h);
-	NZATUpdateMem(h, &lcg_state, sizeof(lcg_state));
-	NZATUpdateMem(h, &v, sizeof(v));
+	/* use LCG as seed but try to get them to deviate immediately */
+	h = lcg_state;
+	(void)rndget();
+	BAFHFinish_reg(h);
+	/* variation through pid, ppid, and the works */
+	BAFHUpdateMem_reg(h, &rndsetupstate, sizeof(rndsetupstate));
+	/* some variation, some possibly entropy, depending on OE */
+	BAFHUpdateMem_reg(h, bp, sz);
+	/* mix them all up */
+	BAFHFinish_reg(h);
+
+	return (h);
+}
+
+mksh_ari_t
+rndget(void)
+{
+	/*
+	 * this is the same Linear Congruential PRNG as Borland
+	 * C/C++ allegedly uses in its built-in rand() function
+	 */
+	return (((lcg_state = 22695477 * lcg_state + 1) >> 16) & 0x7FFF);
+}
+
+void
+rndset(unsigned long v)
+{
+	register uint32_t h;
+#if defined(arc4random_pushb_fast) || defined(MKSH_A4PB)
+	register uint32_t t;
+#endif
+	struct {
+		struct timeval tv;
+		void *sp;
+		uint32_t qh;
+		pid_t pp;
+		short r;
+	} z;
+
+#ifdef DEBUG
+	/* clear the allocated space, for valgrind */
+	memset(&z, 0, sizeof(z));
+#endif
+
+	h = lcg_state;
+	BAFHFinish_reg(h);
+	BAFHUpdateMem_reg(h, &v, sizeof(v));
+
+	mksh_TIME(z.tv);
+	z.sp = &lcg_state;
+	z.pp = procpid;
+	z.r = (short)rndget();
 
 #if defined(arc4random_pushb_fast) || defined(MKSH_A4PB)
+	t = qh_state;
+	BAFHFinish_reg(t);
+	z.qh = (t & 0xFFFF8000) | rndget();
+	lcg_state = (t << 15) | rndget();
 	/*
 	 * either we have very chap entropy get and push available,
 	 * with malloc() pulling in this code already anyway, or the
 	 * user requested us to use the old functions
 	 */
-	lcg_state = h;
-	NZAATFinish(lcg_state);
+	t = h;
+	BAFHUpdateMem_reg(t, &lcg_state, sizeof(lcg_state));
+	BAFHFinish_reg(t);
+	lcg_state = t;
 #if defined(arc4random_pushb_fast)
 	arc4random_pushb_fast(&lcg_state, sizeof(lcg_state));
 	lcg_state = arc4random();
 #else
 	lcg_state = arc4random_pushb(&lcg_state, sizeof(lcg_state));
 #endif
-	NZATUpdateMem(h, &lcg_state, sizeof(lcg_state));
+	BAFHUpdateMem_reg(h, &lcg_state, sizeof(lcg_state));
+#else
+	z.qh = qh_state;
 #endif
 
-	NZAATFinish(h);
+	BAFHUpdateMem_reg(h, &z, sizeof(z));
+	BAFHFinish_reg(h);
 	lcg_state = h;
+}
+
+void
+rndpush(const void *s)
+{
+	register uint32_t h = qh_state;
+
+	BAFHUpdateStr_reg(h, s);
+	BAFHUpdateOctet_reg(h, 0);
+	qh_state = h;
 }
