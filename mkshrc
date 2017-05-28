@@ -24,3 +24,5 @@ PS4='[$EPOCHREALTIME] '; PS1='${|
 if [ "z$ANDROID_SOCKET_adbd" != "z" ]; then
    resize
 fi
+
+alias ls='ls --color=auto'
