@@ -114,8 +114,6 @@ LOCAL_MODULE_PATH := $(TARGET_OUT_VENDOR_EXECUTABLES)
 # mksh source files
 LOCAL_SRC_FILES := $(MKSH_SRC_FILES)
 
-LOCAL_STATIC_LIBRARIES := libc
-
 LOCAL_C_INCLUDES := $(MKSH_INCLUDES)
 
 # Additional flags first...
@@ -126,8 +124,6 @@ LOCAL_CFLAGS += \
     -DMKSH_DEFPATH_OVERRIDE=\"/vendor/bin:/vendor/xbin\" \
 
 LOCAL_CFLAGS += $(MKSH_CFLAGS)
-
-LOCAL_FORCE_STATIC_EXECUTABLE := true
 
 include $(BUILD_EXECUTABLE)
 endif
