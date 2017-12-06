@@ -14,3 +14,5 @@ PS4='[$EPOCHREALTIME] '; PS1='${|
 
 	return $e
 }$HOSTNAME:${PWD:-?} '"$PS1 "
+
+export TERM=xterm-256color
