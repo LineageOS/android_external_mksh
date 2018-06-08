@@ -121,6 +121,7 @@ cc_defaults {
 cc_binary {
     name: "sh",
     defaults: ["sh-defaults"],
+    recovery_available: true,
 }
 
 cc_binary {
