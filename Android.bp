@@ -32,7 +32,6 @@ cc_defaults {
         "-Wno-deprecated-declarations",
         "-fno-asynchronous-unwind-tables",
         "-fno-strict-aliasing",
-        "-fstack-protector",
         "-fwrapv",
 
         // ...various options we choose
