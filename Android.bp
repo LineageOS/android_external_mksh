@@ -139,3 +139,17 @@ cc_binary {
         "-DMKSH_DEFPATH_OVERRIDE=\"/vendor/bin:/vendor/xbin\"",
     ],
 }
+
+// /system/etc/mkshrc
+prebuilt_etc {
+    name: "mkshrc",
+    src: "mkshrc",
+}
+
+// /vendor/etc/mkshrc
+prebuilt_etc {
+    name: "mkshrc_vendor",
+    src: "mkshrc_vendor",
+    filename: "mkshrc",
+    soc_specific: true,
+}
