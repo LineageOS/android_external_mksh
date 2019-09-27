@@ -169,6 +169,7 @@ cc_binary {
 // /system/etc/mkshrc
 prebuilt_etc {
     name: "mkshrc",
+    recovery_available: true,
     src: "mkshrc",
 }
 
