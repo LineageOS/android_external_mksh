@@ -314,6 +314,13 @@ cc_binary {
     defaults: ["mksh_defaults"],
     vendor_ramdisk_available: true,
     host_supported: true,
+    target: {
+        recovery: {
+            cflags: [
+                "-UMKSH_DEFAULT_TMPDIR",
+            ],
+        },
+    },
 }
 
 cc_binary {
