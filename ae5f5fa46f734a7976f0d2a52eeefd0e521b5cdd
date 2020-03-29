@@ -1,0 +1,27 @@
+{
+  "comments": [
+    {
+      "key": {
+        "uuid": "43d7ae18_590e4f66",
+        "filename": "/COMMIT_MSG",
+        "patchSetId": 2
+      },
+      "lineNbr": 9,
+      "author": {
+        "id": 11883
+      },
+      "writtenOn": "2020-03-29T18:36:27Z",
+      "side": 1,
+      "message": "Explain why we can\u0027t use /data\nUpload to AOSP plz",
+      "range": {
+        "startLine": 9,
+        "startChar": 0,
+        "endLine": 9,
+        "endChar": 62
+      },
+      "revId": "ae5f5fa46f734a7976f0d2a52eeefd0e521b5cdd",
+      "serverId": "1ec6b3db-b2c1-4fa4-84a2-4c7efe89ba71",
+      "unresolved": true
+    }
+  ]
+}
