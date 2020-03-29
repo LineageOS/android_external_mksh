@@ -146,6 +146,13 @@ cc_binary {
     name: "sh",
     defaults: ["sh-defaults"],
     vendor_ramdisk_available: true,
+    target: {
+        recovery: {
+            cflags: [
+                "-UMKSH_DEFAULT_TMPDIR",
+            ],
+        },
+    },
 }
 
 cc_binary {
