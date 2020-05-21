@@ -21,7 +21,7 @@
 
 #ifndef SHFLAGS_OPTCS
 #if defined(SHFLAGS_DEFNS)
-__RCSID("$MirOS: src/bin/mksh/sh_flags.opt,v 1.6 2018/08/10 02:53:39 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/sh_flags.opt,v 1.8 2019/12/30 03:58:58 tg Exp $");
 #elif defined(SHFLAGS_ENUMS)
 #define FN(sname,cname,flags,ochar)	cname,
 #define F0(sname,cname,flags,ochar)	cname = 0,

@@ -6,7 +6,7 @@
 /*-
  * Copyright (c) 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
  *		 2011, 2012, 2013, 2014, 2015, 2016, 2017, 2018,
- *		 2019
+ *		 2019, 2020
  *	mirabilos <m@mirbsd.org>
  *
  * Provided that these terms and disclaimer and all copyright notices
@@ -35,7 +35,7 @@
 #include <locale.h>
 #endif
 
-__RCSID("$MirOS: src/bin/mksh/main.c,v 1.351 2019/01/05 13:24:18 tg Exp $");
+__RCSID("$MirOS: src/bin/mksh/main.c,v 1.364 2020/04/13 17:04:14 tg Exp $");
 
 #ifndef MKSHRC_PATH
 #define MKSHRC_PATH	"~/.mkshrc"
@@ -65,8 +65,8 @@ static const char initsubs[] =
     "${EPOCHREALTIME=}";
 
 static const char *initcoms[] = {
-	Ttypeset, "-r", initvsn, NULL,
-	Ttypeset, "-x", "HOME", TPATH, TSHELL, NULL,
+	Ttypeset, Tdr, initvsn, NULL,
+	Ttypeset, Tdx, "HOME", TPATH, TSHELL, NULL,
 	Ttypeset, "-i10", "COLUMNS", "LINES", "SECONDS", "TMOUT", NULL,
 	Talias,
 	"integer=\\\\builtin typeset -i",
@@ -90,7 +90,7 @@ static const char *initcoms[] = {
 };
 
 static const char *restr_com[] = {
-	Ttypeset, "-r", TPATH, "ENV", TSHELL, NULL
+	Ttypeset, Tdr, TPATH, TENV, TSHELL, NULL
 };
 
 static bool initio_done;
@@ -100,7 +100,6 @@ static struct env env;
 struct env *e = &env;
 
 /* compile-time assertions */
-#define cta(name, expr) struct cta_ ## name { char t[(expr) ? 1 : -1]; }
 
 /* this one should be defined by the standard */
 cta(char_is_1_char, (sizeof(char) == 1) && (sizeof(signed char) == 1) &&
@@ -227,7 +226,7 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 	int argi, i;
 	Source *s = NULL;
 	struct block *l;
-	unsigned char restricted_shell, errexit, utf_flag;
+	unsigned char restricted_shell = 0, errexit, utf_flag;
 	char *cp;
 	const char *ccp, **wp;
 	struct tbl *vp;
@@ -303,7 +302,7 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 
 	/* define built-in commands and see if we were called as one */
 	ktinit(APERM, &builtins,
-	    /* currently up to 54 builtins: 75% of 128 = 2^7 */
+	    /* currently up to 52 builtins: 75% of 128 = 2^7 */
 	    7);
 	for (i = 0; mkshbuiltins[i].name != NULL; i++)
 		if (!strcmp(ccp, builtin(mkshbuiltins[i].name,
@@ -315,7 +314,11 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 		argi = parse_args(argv, OF_FIRSTTIME, NULL);
 		if (argi < 0)
 			return (1);
-
+		/* called as rsh, rmksh, -rsh, -rmksh, etc.? */
+		if (ord(*ccp) == ORD('r')) {
+			++ccp;
+			++restricted_shell;
+		}
 #if defined(MKSH_BINSHPOSIX) || defined(MKSH_BINSHREDUCED)
 		/* are we called as -sh or /bin/sh or so? */
 		if (!strcmp(ccp, "sh" MKSH_EXE_EXT)) {
@@ -642,7 +645,7 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 	}
 
 	/* Disable during .profile/ENV reading */
-	restricted_shell = Flag(FRESTRICTED);
+	restricted_shell |= Flag(FRESTRICTED);
 	Flag(FRESTRICTED) = 0;
 	errexit = Flag(FERREXIT);
 	Flag(FERREXIT) = 0;
@@ -656,7 +659,16 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 
 	if (Flag(FLOGIN))
 		include(MKSH_SYSTEM_PROFILE, 0, NULL, true);
-	if (!Flag(FPRIVILEGED)) {
+	if (Flag(FPRIVILEGED)) {
+		include(MKSH_SUID_PROFILE, 0, NULL, true);
+		/* note whether -p was enabled during startup */
+		if (Flag(FPRIVILEGED) == 1)
+			/* allow set -p to setuid() later */
+			Flag(FPRIVILEGED) = 3;
+		else
+			/* turn off -p if not set explicitly */
+			change_flag(FPRIVILEGED, OF_INTERNAL, false);
+	} else {
 		if (Flag(FLOGIN))
 			include(substitute("$HOME/.profile", 0), 0, NULL, true);
 		if (Flag(FTALKING)) {
@@ -664,13 +676,7 @@ main_init(int argc, const char *argv[], Source **sp, struct block **lp)
 			if (cp[0] != '\0')
 				include(cp, 0, NULL, true);
 		}
-	} else {
-		include(MKSH_SUID_PROFILE, 0, NULL, true);
-		/* turn off -p if not set explicitly */
-		if (Flag(FPRIVILEGED) != 1)
-			change_flag(FPRIVILEGED, OF_INTERNAL, false);
 	}
-
 	if (restricted_shell) {
 		c_builtin(restr_com);
 		/* After typeset command... */
@@ -741,6 +747,7 @@ include(const char *name, int argc, const char **argv, bool intr_ok)
 		switch (i) {
 		case LRETURN:
 		case LERROR:
+		case LERREXT:
 			/* see below */
 			return (exstat & 0xFF);
 		case LINTR:
@@ -808,6 +815,8 @@ shell(Source * volatile s, volatile int level)
 	int i;
 
 	newenv(level == 2 ? E_EVAL : E_PARSE);
+	if (level == 2)
+		e->flags |= EF_IN_EVAL;
 	if (interactive)
 		really_exit = false;
 	switch ((i = kshsetjmp(e->jbuf))) {
@@ -815,18 +824,21 @@ shell(Source * volatile s, volatile int level)
 		break;
 	case LBREAK:
 	case LCONTIN:
-		if (level != 2) {
-			source = old_source;
-			quitenv(NULL);
-			internal_errorf(Tf_cant_s, Tshell,
-			    i == LBREAK ? Tbreak : Tcontinue);
+		/* assert: interactive == false */
+		source = old_source;
+		quitenv(NULL);
+		if (level == 2) {
+			/* keep on going */
+			unwind(i);
 			/* NOTREACHED */
 		}
-		/* assert: interactive == false */
-		/* FALLTHROUGH */
+		internal_errorf(Tf_cant_s, Tshell,
+		    i == LBREAK ? Tbreak : Tcontinue);
+		/* NOTREACHED */
 	case LINTR:
 		/* we get here if SIGINT not caught or ignored */
 	case LERROR:
+	case LERREXT:
 	case LSHELL:
 		if (interactive) {
 			if (i == LINTR)
@@ -857,6 +869,8 @@ shell(Source * volatile s, volatile int level)
 	case LRETURN:
 		source = old_source;
 		quitenv(NULL);
+		if (i == LERREXT && level == 2)
+			return (exstat & 0xFF);
 		/* keep on going */
 		unwind(i);
 		/* NOTREACHED */
@@ -916,8 +930,8 @@ shell(Source * volatile s, volatile int level)
  source_no_tree:
 		reclaim();
 	}
-	quitenv(NULL);
 	source = old_source;
+	quitenv(NULL);
 	return (exstat & 0xFF);
 }
 
@@ -926,36 +940,25 @@ shell(Source * volatile s, volatile int level)
 void
 unwind(int i)
 {
-	/*
-	 * This is a kludge. We need to restore everything that was
-	 * changed in the new environment, see cid 1005090337C7A669439
-	 * and 10050903386452ACBF1, but fail to even save things most of
-	 * the time. funcs.c:c_eval() changes FERREXIT temporarily to 0,
-	 * which needs to be restored thus (related to Debian #696823).
-	 * We did not save the shell flags, so we use a special or'd
-	 * value here... this is mostly to clean up behind *other*
-	 * callers of unwind(LERROR) here; exec.c has the regular case.
-	 */
-	if (Flag(FERREXIT) & 0x80) {
-		/* GNU bash does not run this trapsig */
-		trapsig(ksh_SIGERR);
-		Flag(FERREXIT) &= ~0x80;
-	}
+	/* during eval, skip FERREXIT trap */
+	if (i == LERREXT && (e->flags & EF_IN_EVAL))
+		goto defer_traps;
 
 	/* ordering for EXIT vs ERR is a bit odd (this is what AT&T ksh does) */
-	if (i == LEXIT || ((i == LERROR || i == LINTR) &&
+	if (i == LEXIT || ((i == LERROR || i == LERREXT || i == LINTR) &&
 	    sigtraps[ksh_SIGEXIT].trap &&
 	    (!Flag(FTALKING) || Flag(FERREXIT)))) {
 		++trap_nested;
 		runtrap(&sigtraps[ksh_SIGEXIT], trap_nested == 1);
 		--trap_nested;
 		i = LLEAVE;
-	} else if (Flag(FERREXIT) == 1 && (i == LERROR || i == LINTR)) {
+	} else if (Flag(FERREXIT) && (i == LERROR || i == LERREXT || i == LINTR)) {
 		++trap_nested;
 		runtrap(&sigtraps[ksh_SIGERR], trap_nested == 1);
 		--trap_nested;
 		i = LLEAVE;
 	}
+ defer_traps:
 
 	while (/* CONSTCOND */ 1) {
 		switch (e->type) {
@@ -998,8 +1001,7 @@ newenv(int type)
 	ep->temps = NULL;
 	ep->yyrecursive_statep = NULL;
 	ep->type = type;
-	ep->flags = 0;
-	/* jump buffer is invalid because flags == 0 */
+	ep->flags = e->flags & EF_IN_EVAL;
 	e = ep;
 }
 
@@ -1336,6 +1338,39 @@ bi_errorf(const char *fmt, ...)
 	}
 }
 
+/*
+ * Used by functions called by builtins and not:
+ * identical to errorfx if first argument is nil,
+ * like bi_errorf storing the errorlevel into it otherwise
+ */
+void
+maybe_errorf(int *ep, int rc, const char *fmt, ...)
+{
+	va_list va;
+
+	/* debugging: note that stdout not valid */
+	shl_stdout_ok = false;
+
+	exstat = rc;
+
+	va_start(va, fmt);
+	vwarningf(VWARNINGF_ERRORPREFIX | VWARNINGF_FILELINE |
+	    (ep ? VWARNINGF_BUILTIN : 0), fmt, va);
+	va_end(va);
+
+	if (!ep)
+		goto and_out;
+	*ep = rc;
+
+	/* POSIX special builtins cause non-interactive shells to exit */
+	if (builtin_spec) {
+		builtin_argv0 = NULL;
+		/* may not want to use LERROR here */
+ and_out:
+		unwind(LERROR);
+	}
+}
+
 /* Called when something that shouldn't happen does */
 void
 internal_errorf(const char *fmt, ...)
@@ -1435,7 +1470,7 @@ initio(void)
 	if ((lfp = getenv("SDMKSH_PATH")) == NULL) {
 		if ((lfp = getenv("HOME")) == NULL || !mksh_abspath(lfp))
 			errorf("can't get home directory");
-		lfp = shf_smprintf(Tf_sSs, lfp, "mksh-dbg.txt");
+		strpathx(lfp, lfp, "mksh-dbg.txt", 1);
 	}
 
 	if ((shl_dbg_fd = open(lfp, O_WRONLY | O_APPEND | O_CREAT, 0600)) < 0)
@@ -1997,7 +2032,7 @@ init_environ(void)
 	errno = 0;
 	if ((dent = readdir(dirp)) != NULL) {
 		if (skip_varname(dent->d_name, true)[0] == '\0') {
-			xp = shf_smprintf(Tf_sSs, MKSH_ENVDIR, dent->d_name);
+			strpathx(xp, MKSH_ENVDIR, dent->d_name, 1);
 			if (!(shf = shf_open(xp, O_RDONLY, 0, 0))) {
 				warningf(false,
 				    "cannot read environment %s from %s: %s",
