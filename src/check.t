@@ -1,4 +1,4 @@
-# $MirOS: src/bin/mksh/check.t,v 1.838 2020/04/13 19:51:08 tg Exp $
+# $MirOS: src/bin/mksh/check.t,v 1.845 2020/05/16 22:19:15 tg Exp $
 # -*- mode: sh -*-
 #-
 # Copyright © 2003, 2004, 2005, 2006, 2007, 2008, 2009, 2010,
@@ -31,7 +31,7 @@
 # (2013/12/02 20:39:44) http://cvsweb.openbsd.org/cgi-bin/cvsweb/src/regress/bin/ksh/?sortby=date
 
 expected-stdout:
-	KSH R59 2020/04/14
+	KSH R59 2020/05/16
 description:
 	Check base version of full shell
 stdin:
@@ -8082,45 +8082,50 @@ name: test-str-pattern
 description:
 	Check that [[ x = $y ]] can take extglobs, like ksh93
 stdin:
+	[[ -n $BASH_VERSION ]] && shopt -s extglob
+	function one {
+		n=$1 x=$2 y=$3 z=${4:-$3}
+		[[ $x = $y ]]; a=$?
+		[[ $x = "$y" ]]; b=$?
+		eval '[[ $x = '"$z"' ]]; c=$?'
+		eval '[[ $x = "'"$z"'" ]]; d=$?'
+		echo $n $a $b $c $d .
+	}
 	x='a\'
-	[[ $x = a\  ]]; echo 1 $? .
-	[[ $x = a\\  ]]; echo 2 $? .
-	y='a\'
-	[[ $x = $y ]]; echo 3 $? .
-	[[ $x = "$y" ]]; echo 4 $? .
-	x='a\b'
-	y='a\b'
-	[[ $x = $y ]]; echo 5 $? .
-	[[ $x = "$y" ]]; echo 6 $? .
-	y='a\\b'
-	[[ $x = $y ]]; echo 7 $? .
-	[[ $x = "$y" ]]; echo 8 $? .
-	x='foo'
-	y='f+(o)'
-	[[ $x = $y ]]; echo 9 $? .
-	[[ $x = "$y" ]]; echo 10 $? .
-	x=$y
-	[[ $x = $y ]]; echo 11 $? .
-	[[ $x = "$y" ]]; echo 12 $? .
+	[[ $x = a\  ]]; echo 01 $? .
+	[[ $x = a\\ ]]; echo 02 $? .
+	one 03 'a\'	'a\'	'a\\'
+	one 04 'a\b'	'a\b'
+	one 05 'a\b'	'a\\b'
+	one 06 'foo'	'f+(o)'
+	one 07 'f+(o)'	'f+(o)'
+	one 08 'f+(o'	'f+(o'	'f+\(o'
+	one 09 foo	'f+(o'	'f+\(o'
+	one 10 abcde	'a\*e'
+	one 11 'a*e'	'a\*e'
+	one 12 'a\*e'	'a\*e'
+	echo extras:
 	x='f+(o'
-	y=$x
-	[[ $x = $y ]]; echo 13 $? .
-	[[ $x = "$y" ]]; echo 14 $? .
+	z='f+(o'
+	eval '[[ $x = "'"$z"'" ]]; echo 14 $? "(08:4)" .'
+	x=foo
+	eval '[[ $x = "'"$z"'" ]]; echo 15 $? "(09:4)" .'
 expected-stdout:
-	1 1 .
-	2 0 .
-	3 0 .
-	4 0 .
-	5 1 .
-	6 0 .
-	7 0 .
-	8 1 .
-	9 0 .
-	10 1 .
-	11 1 .
-	12 0 .
-	13 0 .
-	14 0 .
+	01 1 .
+	02 0 .
+	03 0 0 0 0 .
+	04 1 0 1 0 .
+	05 0 1 0 0 .
+	06 0 1 0 1 .
+	07 1 0 1 0 .
+	08 0 0 0 1 .
+	09 1 1 1 1 .
+	10 1 1 1 1 .
+	11 0 1 0 1 .
+	12 1 0 1 0 .
+	extras:
+	14 0 (08:4) .
+	15 1 (09:4) .
 ---
 name: test-precedence-1
 description:
@@ -8448,8 +8453,10 @@ description:
 stdin:
 	set -o braceexpand
 	set +o sh
-	[[ $(set +o) == *@(-o sh)@(| *) ]] && echo sh || echo nosh
-	[[ $(set +o) == *@(-o braceexpand)@(| *) ]] && echo brex || echo nobrex
+	[[ -o sh ]] && echo sh
+	[[ -o !sh ]] && echo nosh
+	[[ -o braceexpand ]] && echo brex
+	[[ -o !braceexpand ]] && echo nobrex
 	echo {a,b,c}
 	set +o braceexpand
 	echo {a,b,c}
@@ -8457,12 +8464,17 @@ stdin:
 	echo {a,b,c}
 	set -o sh
 	echo {a,b,c}
-	[[ $(set +o) == *@(-o sh)@(| *) ]] && echo sh || echo nosh
-	[[ $(set +o) == *@(-o braceexpand)@(| *) ]] && echo brex || echo nobrex
+	[[ -o sh ]] && echo sh
+	[[ -o !sh ]] && echo nosh
+	[[ -o braceexpand ]] && echo brex
+	[[ -o !braceexpand ]] && echo nobrex
 	set -o braceexpand
 	echo {a,b,c}
-	[[ $(set +o) == *@(-o sh)@(| *) ]] && echo sh || echo nosh
-	[[ $(set +o) == *@(-o braceexpand)@(| *) ]] && echo brex || echo nobrex
+	[[ -o sh ]] && echo sh
+	[[ -o !sh ]] && echo nosh
+	[[ -o braceexpand ]] && echo brex
+	[[ -o !braceexpand ]] && echo nobrex
+	[[ $(exec -a -set "$__progname" -o) = *login+(' ')on* ]]; echo $?
 expected-stdout:
 	nosh
 	brex
@@ -8475,44 +8487,110 @@ expected-stdout:
 	a b c
 	sh
 	brex
+	0
 ---
 name: sh-mode-2a
 description:
 	Check that posix or sh mode is *not* automatically turned on
 category: !binsh
 stdin:
-	ln -s "$__progname" ksh || cp "$__progname" ksh
-	ln -s "$__progname" sh || cp "$__progname" sh
-	ln -s "$__progname" ./-ksh || cp "$__progname" ./-ksh
-	ln -s "$__progname" ./-sh || cp "$__progname" ./-sh
-	for shell in {,-}{,k}sh; do
-		print -- $shell $(./$shell +l -c \
-		    '[[ $(set +o) == *"-o "@(sh|posix)@(| *) ]] && echo sh || echo nosh')
+	for shell in {,-}{,r}{,k,mk}sh {,-}{,R}{,K,MK}SH.EXE; do
+		ln -s "$__progname" ./$shell || cp "$__progname" ./$shell
+		print -- $shell $(./$shell +l -c '
+			[[ -o sh || -o posix ]] && echo sh
+			[[ -o !sh && -o !posix ]] && echo nosh
+			[[ -o restricted ]] && echo lim || echo ok
+		    ')
 	done
 expected-stdout:
-	sh nosh
-	ksh nosh
-	-sh nosh
-	-ksh nosh
+	sh nosh ok
+	ksh nosh ok
+	mksh nosh ok
+	rsh nosh lim
+	rksh nosh lim
+	rmksh nosh lim
+	-sh nosh ok
+	-ksh nosh ok
+	-mksh nosh ok
+	-rsh nosh lim
+	-rksh nosh lim
+	-rmksh nosh lim
+	SH.EXE nosh ok
+	KSH.EXE nosh ok
+	MKSH.EXE nosh ok
+	RSH.EXE nosh lim
+	RKSH.EXE nosh lim
+	RMKSH.EXE nosh lim
+	-SH.EXE nosh ok
+	-KSH.EXE nosh ok
+	-MKSH.EXE nosh ok
+	-RSH.EXE nosh lim
+	-RKSH.EXE nosh lim
+	-RMKSH.EXE nosh lim
 ---
 name: sh-mode-2b
 description:
 	Check that posix or sh mode *is* automatically turned on
 category: binsh
 stdin:
-	ln -s "$__progname" ksh || cp "$__progname" ksh
-	ln -s "$__progname" sh || cp "$__progname" sh
-	ln -s "$__progname" ./-ksh || cp "$__progname" ./-ksh
-	ln -s "$__progname" ./-sh || cp "$__progname" ./-sh
-	for shell in {,-}{,k}sh; do
-		print -- $shell $(./$shell +l -c \
-		    '[[ $(set +o) == *"-o "@(sh|posix)@(| *) ]] && echo sh || echo nosh')
+	for shell in {,-}{,r}{,k,mk}sh {,-}{,R}{,K,MK}SH.EXE; do
+		ln -s "$__progname" ./$shell || cp "$__progname" ./$shell
+		print -- $shell $(./$shell +l -c '
+			[[ -o sh || -o posix ]] && echo sh
+			[[ -o !sh && -o !posix ]] && echo nosh
+			[[ -o restricted ]] && echo lim || echo ok
+		    ')
 	done
 expected-stdout:
-	sh sh
-	ksh nosh
-	-sh sh
-	-ksh nosh
+	sh sh ok
+	ksh nosh ok
+	mksh nosh ok
+	rsh sh lim
+	rksh nosh lim
+	rmksh nosh lim
+	-sh sh ok
+	-ksh nosh ok
+	-mksh nosh ok
+	-rsh sh lim
+	-rksh nosh lim
+	-rmksh nosh lim
+	SH.EXE sh ok
+	KSH.EXE nosh ok
+	MKSH.EXE nosh ok
+	RSH.EXE sh lim
+	RKSH.EXE nosh lim
+	RMKSH.EXE nosh lim
+	-SH.EXE sh ok
+	-KSH.EXE nosh ok
+	-MKSH.EXE nosh ok
+	-RSH.EXE sh lim
+	-RKSH.EXE nosh lim
+	-RMKSH.EXE nosh lim
+---
+name: sh-options
+description:
+	Check that "set +o" DTRT per POSIX
+stdin:
+	t() {
+		[[ -o vi ]]; a=$?
+		[[ -o pipefail ]]; b=$?
+		echo $((++i)) $a $b .
+	}
+	set -e
+	set -o vi
+	set +o pipefail
+	set +e
+	t
+	x=$(set +o)
+	set +o vi
+	set -o pipefail
+	t
+	eval "$x"
+	t
+expected-stdout:
+	1 0 1 .
+	2 1 0 .
+	3 0 1 .
 ---
 name: pipeline-1
 description:

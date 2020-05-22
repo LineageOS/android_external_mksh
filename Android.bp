@@ -107,7 +107,7 @@ cc_defaults {
         "-DHAVE_SYS_ERRLIST_DECL=0",
         "-DHAVE_SYS_SIGLIST_DECL=1",
         "-DHAVE_PERSISTENT_HISTORY=0",
-        "-DMKSH_BUILD_R=591",
+        "-DMKSH_BUILD_R=592",
 
         // Additional flags
         "-DMKSH_DEFAULT_PROFILEDIR=\"/system/etc\"",
