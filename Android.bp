@@ -2,6 +2,24 @@
 //    Thorsten Glaser <t.glaser@tarent.de>
 // This file is provided under the same terms as mksh.
 
+package {
+    default_applicable_licenses: ["external_mksh_license"],
+}
+
+license {
+    name: "external_mksh_license",
+    visibility: [":__subpackages__"],
+    license_kinds: [
+        "SPDX-license-identifier-BSD",
+        "SPDX-license-identifier-MIT",
+        "SPDX-license-identifier-Unicode-DFS",
+        "legacy_notice",
+    ],
+    license_text: [
+        "NOTICE",
+    ],
+}
+
 cc_defaults {
     name: "sh-defaults",
 
