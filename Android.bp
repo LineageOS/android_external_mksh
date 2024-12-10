@@ -145,8 +145,14 @@ cc_defaults {
 cc_binary {
     name: "sh",
     defaults: ["sh-defaults"],
-    recovery_available: true,
     vendor_ramdisk_available: true,
+}
+
+cc_binary {
+    name: "sh.recovery",
+    defaults: ["sh-defaults"],
+    recovery: true,
+    stem: "sh",
 }
 
 cc_binary {
